@@ -120,7 +120,17 @@ class TypeConverter(object):
         }
 
         if schema_node.title:
-            converted['title'] = schema_node.title
+            # ignore the names key use as useful keywords to define location
+            if schema_node.name in ["header", "body", "querystring", "path"]:
+                converted['title'] = schema_node.title
+            else:
+                # otherwise use either the explicitly provided title or name
+                # colander capitalizes the title, which makes it wrong most of the time
+                # when using CamelCase or camelBack schema definitions
+                if isinstance(schema_node.raw_title, str):
+                    converted['title'] = schema_node.title
+                else:
+                    converted['title'] = schema_node.name
         if schema_node.description:
             # keep 'description' for back-compatibility
             converted['summary'] = converted['description'] = schema_node.description
