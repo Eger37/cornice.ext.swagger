@@ -617,9 +617,9 @@ class CorniceSwagger(object):
                 # move 'consumes' and 'produces' under their OpenAPI 3 'equivalents'
                 else:
                     # OpenAPI 3 supports multiple schemas, but they should have different content-type
-                    op = self._convert_to_oai3(op)
+                    op = self._convert_to_oas3(op)
                     if previous_definition:
-                        self._validate_diff_oai3(op, previous_definition, path)
+                        self._validate_diff_oas3(op, previous_definition, path)
 
                 # If tag not defined and a default tag is provided
                 if 'tags' not in op and self.default_tags:
@@ -663,7 +663,7 @@ class CorniceSwagger(object):
 
         return paths, tags
 
-    def _convert_to_oai3(self, operations):
+    def _convert_to_oas3(self, operations):
         """
         Extract 'consumes' and 'produces' objects from OpenAPI 2 (swagger)
         definition and generates their equivalent for OpenAPI 3 format.
@@ -716,7 +716,7 @@ class CorniceSwagger(object):
                     operations['responses'][code]['content'] = {ctype: {'schema': body.copy()}}
         return operations
 
-    def _validate_diff_oai3(self, operation, previous_definition, path):
+    def _validate_diff_oas3(self, operation, previous_definition, path):
         """
         Validates that two corresponding path operation definitions
         (generated from two different views) each describe their respective
@@ -837,14 +837,23 @@ class CorniceSwagger(object):
 
         # Get parameters from view schema
         is_colander = self._is_colander_schema(args)
+        deprecated = False
         if is_colander:
             schema = self._extract_transform_colander_schema(args)
             parameters = self.parameters.from_schema(schema)
+            deprecated = getattr(schema, 'deprecated', False)
         else:
             # Bail out for now
             parameters = None
         if parameters:
             op['parameters'] = parameters
+
+        if not isinstance(deprecated, bool):
+            deprecated = False
+        if not deprecated and not isinstance(view, six.string_types):
+            deprecated = getattr(view, 'deprecated', False)
+        if deprecated is True:
+            op['deprecated'] = True
 
         # Get summary from docstring
         if self.summary_docstrings:
@@ -877,7 +886,8 @@ class CorniceSwagger(object):
 
         return op
 
-    def _is_colander_schema(self, args):
+    @staticmethod
+    def _is_colander_schema(args):
         schema = args.get('schema')
         return (isinstance(schema, colander.Schema) or
                 (inspect.isclass(schema)

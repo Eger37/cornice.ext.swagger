@@ -4,6 +4,8 @@ CHANGES
 1.0.1 (unreleased)
 ------------------
 
+- Support of ``deprecated`` path/method keyword from view/schema.
+- Support OpenAPI 3.0.0 specification generation.
 - Support ``oneOf, allOf, anyOf, not`` keywords for objects and arrays.
   Requires ``openapi_spec=3`` when calling ``CorniceSwagger().generate()`` ::
 
