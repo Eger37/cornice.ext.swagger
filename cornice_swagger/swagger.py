@@ -72,7 +72,7 @@ class DefinitionHandler(object):
         if depth == 0:
             return schema
 
-        for _of in ['oneOf', 'allOf', 'anyOf']:
+        for _of in ['oneOf', 'allOf', 'anyOf', 'not']:
             items = schema.get(_of)
             if isinstance(items, list):
                 return self._process_items(schema, _of, items, depth, base_name)
