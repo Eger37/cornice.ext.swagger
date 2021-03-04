@@ -1,8 +1,9 @@
-"""Cornice Swagger 2.0 documentor"""
+"""Cornice Swagger 2.0 and OpenAPI 3 documentor"""
 import inspect
 import warnings
 from collections import OrderedDict
 from distutils.version import LooseVersion
+from typing import TYPE_CHECKING
 
 import colander
 from cornice.util import to_list
@@ -12,6 +13,38 @@ import six
 from cornice_swagger.util import body_schema_transformer, merge_dicts, trim
 from cornice_swagger.converters import (TypeConversionDispatcher as TypeConverter,
                                         ParameterConversionDispatcher as ParameterConverter)
+
+if TYPE_CHECKING:
+    import typing
+    from typing import Dict, List, Optional, Union
+    if hasattr(typing, "TypedDict"):
+        from typing import TypedDict
+    else:
+        from typing_extensions import TypedDict  # noqa
+
+    SwaggerInfo = TypedDict("SwaggerInfo", {"title": Optional[str], "version": Optional[str]}, total=False)
+    SwaggerTag = TypedDict("SwaggerTag", {"name": str}, total=False)
+    SwaggerDoc = TypedDict("SwaggerDoc", {"description": str, "url": str})
+    SwaggerRef = TypedDict("SwaggerRef", {"$ref": str})
+    SwaggerSummary = Optional[str]
+    SwaggerSchema = TypedDict("SwaggerSchema", {"type": str, "title": str,
+                                                "required": Optional[List[str]],
+                                                "items": Optional[List["SwaggerSchemaRef"]],
+                                                "properties": Dict[str, "SwaggerSchemaRef"]}, total=False)
+    SwaggerSchemaRef = Union[SwaggerSchema, SwaggerRef]
+    SwaggerContent = TypedDict("SwaggerContent", {"schema": SwaggerSchemaRef})
+    SwaggerResponse = TypedDict("SwaggerResponse", {"summary": SwaggerSummary, "content": Dict[str, SwaggerContent]})
+    SwaggerParameter = TypedDict("SwaggerParameter", {"name": str, "in": str, "required": bool, "type": str})
+    SwaggerSecurity = TypedDict("SwaggerSecurity", {"type": str, "name": str, "in": str})
+    SwaggerPath = TypedDict("SwaggerPath", {"responses": Dict[str, SwaggerResponse],
+                                            "parameters": List[SwaggerParameter],
+                                            "summary": SwaggerSummary,
+                                            "tags": List[str]}, total=False)
+    SwaggerType = TypedDict("SwaggerType", {"info": SwaggerInfo, "host": Optional[str], "schemes": List[str],
+                                            "basePath": str, "swagger": Optional[str], "openapi": Optional[str],
+                                            "tags": List[SwaggerTag], "paths": Dict[str, SwaggerPath],
+                                            "externalDocs": Optional[SwaggerDoc],
+                                            "securityDefinitions": Optional[Dict[str, SwaggerSecurity]]}, total=False)
 
 
 class CorniceSwaggerException(Exception):
@@ -57,7 +90,7 @@ class DefinitionHandler(object):
             Base swagger schema.
         :param depth:
             How many levels of the swagger object schemas should be split into
-            swaggger definitions with JSON pointers. Default (0) is no split.
+            swagger definitions with JSON pointers. Default (0) is no split.
             You may use negative values to split everything.
         :param base_name:
             If schema doesn't have a name, the caller may provide it to be
@@ -392,7 +425,7 @@ class CorniceSwagger(object):
     base_path = '/'
     """Base path of the documented API. Default is "/"."""
 
-    swagger = {'info': {}}
+    swagger = {'info': {}}  # type: SwaggerType
     """Base OpenAPI document that should be merged with the extracted info
     from the generate call."""
 
@@ -528,7 +561,7 @@ class CorniceSwagger(object):
         """Deprecated alias of `generate`."""
         self.__dict__.update(**kwargs)
 
-        message = ("Calling `CorniceSwagger is deprecated, call `generate` instead")
+        message = "Calling `CorniceSwagger is deprecated, call `generate` instead"
         warnings.warn(message, DeprecationWarning)
         return self.generate(*args, **kwargs)
 
