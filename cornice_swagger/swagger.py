@@ -137,7 +137,8 @@ class DefinitionHandler(object):
                     break
             # otherwise process the item normally
             else:
-                ref = self._ref_recursive(item, depth-1, base_name)
+                sub_name = schema.get('title') or (base_name + "Item" + str(i))
+                ref = self._ref_recursive(item, depth-1, sub_name)
                 ref_list.append(ref)
         self.definition_registry[base_name] = {list_type: ref_list}
         return ref_pointer
