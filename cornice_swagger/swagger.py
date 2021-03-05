@@ -105,10 +105,10 @@ class DefinitionHandler(object):
         if depth == 0:
             return schema
 
-        for _of in ['oneOf', 'allOf', 'anyOf', 'not']:
-            items = schema.get(_of)
+        for kw in ['oneOf', 'allOf', 'anyOf', 'not']:
+            items = schema.get(kw)
             if isinstance(items, list):
-                return self._process_items(schema, _of, items, depth, base_name)
+                return self._process_items(schema, kw, items, depth, base_name)
 
         if schema['type'] == 'array' and isinstance(schema['items'], dict):
             ref_pointer = self._schema_object_to_pointer(schema, depth, base_name)
@@ -125,10 +125,21 @@ class DefinitionHandler(object):
 
     def _process_items(self, schema, list_type, item_list, depth, base_name):
         ref_pointer = self._schema_object_to_pointer(schema, depth, base_name)
-        self.definition_registry[base_name] = {
-            list_type: [self._ref_recursive(item, depth-1)
-                        for item in item_list]
-        }
+        ref_list = []
+        for i, item in enumerate(item_list):
+            # recursively process nested keywords (eg: oneOf[allOf[x,y], allOf[x,z]])
+            for kw in ['oneOf', 'allOf', 'anyOf', 'not']:
+                sub_items = item.get(kw)
+                if isinstance(sub_items, list):
+                    sub_name = item.get('title') or (base_name + kw[0].upper() + kw[1:] + "Item" + str(i))
+                    ref = self._process_items(item, kw, sub_items, depth-1, sub_name)
+                    ref_list.append(ref)
+                    break
+            # otherwise process the item normally
+            else:
+                ref = self._ref_recursive(item, depth-1, base_name)
+                ref_list.append(ref)
+        self.definition_registry[base_name] = {list_type: ref_list}
         return ref_pointer
 
     @staticmethod
