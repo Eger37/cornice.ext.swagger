@@ -710,10 +710,15 @@ class CorniceSwagger(object):
         for code in operations.get('responses', []):
             if code == 'default':
                 continue
-            body = operations['responses'][code].pop('schema', None)
+            resp = operations['responses'][code]
+            if '$ref' in resp:
+                body = resp
+            else:
+                body = resp.pop('schema', None)
             if body:
                 for ctype in produces:
-                    operations['responses'][code]['content'] = {ctype: {'schema': body.copy()}}
+                    resp['content'] = {ctype: {'schema': body.copy()}}
+                    resp.pop('$ref', None)
         return operations
 
     def _validate_diff_oas3(self, operation, previous_definition, path):
