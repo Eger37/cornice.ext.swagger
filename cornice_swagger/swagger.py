@@ -108,6 +108,7 @@ class DefinitionHandler(object):
         for kw in ['oneOf', 'allOf', 'anyOf', 'not']:
             items = schema.get(kw)
             if isinstance(items, list):
+                base_name = schema.get("title") or base_name
                 return self._process_items(schema, kw, items, depth, base_name)
 
         if schema['type'] == 'array' and isinstance(schema['items'], dict):
@@ -137,7 +138,7 @@ class DefinitionHandler(object):
                     break
             # otherwise process the item normally
             else:
-                sub_name = schema.get('title') or (base_name + "Item" + str(i))
+                sub_name = item.get('title') or (base_name + "Item" + str(i))
                 ref = self._ref_recursive(item, depth-1, sub_name)
                 ref_list.append(ref)
         self.definition_registry[base_name] = {list_type: ref_list}
