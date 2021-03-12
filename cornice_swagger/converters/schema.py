@@ -180,6 +180,27 @@ class IntegerTypeConverter(NumberTypeConverter):
     type = 'integer'
 
 
+class TimeTypeConverter(BaseStringTypeConverter):
+    format = 'time'
+
+
+STRING_FORMATTERS = {
+    # officials
+    'email': {'converter': BaseStringTypeConverter, 'validator': colander.Email},
+    'url': {'converter': BaseStringTypeConverter, 'validator': colander.url},
+    'date': {'converter': DateTypeConverter, 'validator': None},
+    'date-time': {'converter': DateTimeTypeConverter, 'validator': None},
+    'password': {'converter': BaseStringTypeConverter, 'validator': colander},
+    'binary': {'converter': BaseStringTypeConverter, 'validator': colander.file_uri},
+    'byte': {'converter': BaseStringTypeConverter, 'validator': colander.file_uri},
+    # common but unofficial
+    'time': {'converter': TimeTypeConverter, 'validator': None},
+    'hostname': {'converter': BaseStringTypeConverter, 'validator': colander.url},
+    'uuid': {'converter': BaseStringTypeConverter, 'validator': colander.uuid},
+    'file': {'converter': BaseStringTypeConverter, 'validator': colander.file_uri},
+}
+
+
 class StringTypeConverter(BaseStringTypeConverter):
     """
     Converts any type of string according to keyword arguments passed to the schema node.
@@ -204,27 +225,13 @@ class StringTypeConverter(BaseStringTypeConverter):
         kwarg_pattern = getattr(schema_node, 'pattern', None)
         kwarg_validator = getattr(schema_node, 'validator', None)
         if kwarg_format or kwarg_pattern:
-            known_formats = {
-                # officials
-                'email': {'converter': BaseStringTypeConverter, 'validator': colander.Email},
-                'url': {'converter': BaseStringTypeConverter, 'validator': colander.url},
-                'date': {'converter': DateTypeConverter, 'validator': None},
-                'date-time': {'converter': DateTimeTypeConverter, 'validator': None},
-                'password': {'converter': BaseStringTypeConverter, 'validator': colander},
-                'binary': {'converter': BaseStringTypeConverter, 'validator': colander.file_uri},
-                'byte': {'converter': BaseStringTypeConverter, 'validator': colander.file_uri},
-                # common but unofficial
-                'time': {'converter': TimeTypeConverter, 'validator': None},
-                'hostname': {'converter': BaseStringTypeConverter, 'validator': colander.url},
-                'uuid': {'converter': BaseStringTypeConverter, 'validator': colander.uuid},
-                'file': {'converter': BaseStringTypeConverter, 'validator': colander.file_uri},
-            }
+
             # extended conversion/validation for known ones
-            if kwarg_format and kwarg_format.lower() in known_formats:
+            if kwarg_format and kwarg_format.lower() in STRING_FORMATTERS:
                 kwarg_format = kwarg_format.lower()
-                format_converter_class = known_formats[kwarg_format]['converter']
+                format_converter_class = STRING_FORMATTERS[kwarg_format]['converter']
                 if kwarg_validator is None:
-                    format_validator = known_formats[kwarg_format]['validator']
+                    format_validator = STRING_FORMATTERS[kwarg_format]['validator']
                     setattr(schema_node, 'validator', format_validator)
             elif kwarg_format == 'pattern' and not isinstance(kwarg_pattern, colander.Regex):
                 raise NoSuchConverter(
@@ -259,10 +266,6 @@ class StringTypeConverter(BaseStringTypeConverter):
         convert_regex_validator,
         convert_oneof_validator_factory(),
     )
-
-
-class TimeTypeConverter(BaseStringTypeConverter):
-    format = 'time'
 
 
 class ObjectTypeConverter(TypeConverter):
