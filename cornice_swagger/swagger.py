@@ -343,6 +343,15 @@ class ResponseHandler(object):
             pointer = response_schema.__class__.__name__
             if self.ref:
                 response = self._ref(response, pointer)
+
+            # warning:
+            #   if using swagger 2.0, cannot have both examples and $ref, examples will be ignored
+            #   provide them here for OpenAPIv3 that can show both schemas and examples, or Swagger 2.0 without $ref
+            # see (at bottom): https://swagger.io/docs/specification/2-0/adding-examples/
+            examples = getattr(response_schema, 'examples', None)
+            if isinstance(examples, dict):
+                response['examples'] = examples
+
             responses[status] = response
 
         return responses
@@ -700,10 +709,15 @@ class CorniceSwagger(object):
         parameters = operations.get('parameters', {})
         bodies = []
         for param in parameters:
-            if param.get('in') == 'body':
-                body = param
-                parameters.remove(body)
-                bodies.append(body)
+            param_def = param
+            param_ref = None
+            if '$ref' in param:
+                param_ref = param
+                param_key = param['$ref'].split('/parameters/')[-1]
+                param_def = self.parameters.parameter_registry.get(param_key)
+            if param_def.get('in') == 'body':
+                parameters.remove(param)
+                bodies.append((param_def, param_ref))
         if bodies:
             # use-cases:
             # (1) single view specified content_type=(<multiple-types>,...) but
@@ -715,13 +729,14 @@ class CorniceSwagger(object):
             #     results will be merged at the end
             required = False
             operations['requestBody'] = {'content': {}}
-            for body in bodies:
+            for body, body_ref in bodies:
                 body.pop('in')
                 if not len(consumes):
                     consumes = [getattr(body, 'content_type', self.default_content_type)]
                 for ctype in consumes:
                     required = required or body.pop('required', False)
-                    operations['requestBody']['content'].update({ctype: body.copy()})
+                    body_def = body_ref if body_ref else body
+                    operations['requestBody']['content'].update({ctype: body_def.copy()})
             operations['requestBody']['required'] = required
 
         produces = operations.pop('produces', [])
@@ -737,7 +752,11 @@ class CorniceSwagger(object):
                 body = resp.pop('schema', None)
             if body:
                 for ctype in produces:
-                    resp['content'] = {ctype: {'schema': body.copy()}}
+                    content = {'schema': body.copy()}
+                    examples = resp.pop('examples', None)
+                    if examples:
+                        content['examples'] = examples
+                    resp['content'] = {ctype: content}
                     resp.pop('$ref', None)
         return operations
 
