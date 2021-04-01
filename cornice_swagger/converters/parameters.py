@@ -75,6 +75,12 @@ class BodyParameterConverter(ParameterConverter):
         schema = definition_handler(schema_node)
         converted['schema'] = schema
 
+        examples = getattr(schema_node, 'examples', None)
+        if examples and isinstance(examples, dict) and (
+                all(isinstance(name, str) and isinstance(ex, dict) for name, ex in examples.items())
+        ):
+            converted['examples'] = examples
+
         return converted
 
 
