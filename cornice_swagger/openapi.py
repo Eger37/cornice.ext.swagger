@@ -139,11 +139,24 @@ class XMLObject(object):
         - https://github.com/OAI/OpenAPI-Specification/blob/master/versions/3.0.3.md#user-content-xml-object
         - https://swagger.io/docs/specification/data-models/representing-xml/
     """
-    attribute = None    # define the corresponding node object as attribute instead of field
-    name = None         # name of the attribute, or default to the class name of the object
-    namespace = None    # location of "xmlns:<prefix> <location>" specification
-    prefix = None       # prefix of the namespace
-    wrapped = None      # used to wrap array elements called "<name>" within a block called "<name>s"
+    attribute = None  # type: Optional[bool]
+    """Indicates if the corresponding node object must be placed as XML attribute instead of field."""
+
+    name = None  # type: Optional[str]
+    """Name of the attribute, or default to the class name of the object."""
+
+    namespace = None  # type: Optional[str]
+    """URL location of the namespace prefix that is usually included as 'xmlns:<prefix> <location>' specification."""
+
+    prefix = None  # type: Optional[str]
+    """Prefix associated to the namespace location to where schema definitions are defined. 
+    
+    If ``None``, there will be no prefix. 
+    If ``str`` is provided, the generated schema will correspond to ``<prefix>:<XMLObject>``.
+    """
+
+    wrapped = None  # type: Optional[bool]
+    """Indicates if the schema must be wrapped as array elements called '<name>' within a block called '<name>s'."""
 
     @property
     def xml(self):
@@ -291,6 +304,14 @@ class DropableSchemaNode(ExtendedNodeInterface, ExtendedSchemaBase):
     _extension = "_ext_dropable"
 
     def __init__(self, *args, **kwargs):
+        # schema-type Enum is somewhat troublesome as its __init__ has a mandatory 'enum_cls' parameter
+        # while all other schema-types have no requirement and retrieve definitions from class attributes
+        # since enum is basically a str/int with members as OneOf validator, simply convert it
+        if self.schema_type is colander.Enum:
+            from cornice_swagger.common import OneOfEnum
+            self.schema_type = ExtendedString
+            self.validator = OneOfEnum(self.enum_cls, attr=self.attr)
+
         super(DropableSchemaNode, self).__init__(*args, **kwargs)
         setattr(self, DropableSchemaNode._extension, True)
 
@@ -1633,8 +1654,8 @@ def _make_node_instance(schema_node_or_class):
     return schema_node_or_class
 
 
-def _get_schema_type(schema_node, check=False):
-    # type: (Union[colander.SchemaNode, Type[colander.SchemaNode]], bool) -> Optional[colander.SchemaType]
+def _get_schema_type(schema_node, check=False, instantiate=True):
+    # type: (Union[colander.SchemaNode, Type[colander.SchemaNode]], bool, bool) -> Optional[colander.SchemaType]
     """Obtains the schema-type from the provided node, supporting various initialization methods.
 
     - ``typ`` is set by an instantiated node from specific schema (e.g.: ``colander.SchemaNode(colander.String())``)
@@ -1642,12 +1663,13 @@ def _get_schema_type(schema_node, check=False):
 
     :param schema_node: item to analyse
     :param check: only attempt to retrieve the schema type, and if failing return ``None``
+    :param instantiate: generate the schema-type instance from plain class reference
     :returns: found schema type
     :raises ConversionTypeError: if no ``check`` requested and schema type cannot be found (invalid schema node)
     """
     schema_node = _make_node_instance(schema_node)
     schema_type = getattr(schema_node, "typ", getattr(schema_node, "schema_type"))
-    if isinstance(schema_type, type):
+    if isinstance(schema_type, type) and instantiate:
         schema_type = schema_type()  # only type instead of object, instantiate with default since no parameters anyway
     if not isinstance(schema_type, colander.SchemaType):
         if check:

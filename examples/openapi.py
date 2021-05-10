@@ -4,15 +4,17 @@ so that one can update the swagger without touching any other files after the in
 """
 # pylint: disable=C0103,invalid-name
 
+import argparse
 import datetime
 import enum
 import os
+import sys
 import yaml
 
-from colander import DateTime, Email, OneOf, Range, drop, null, required
+from colander import DateTime, Email, Enum, Range, drop, required
 from cornice import Service
 from pyramid.config import Configurator
-from pyramid.httpexceptions import HTTPBadRequest, HTTPCreated, HTTPConflict, HTTPNotFound
+from pyramid.httpexceptions import HTTPBadRequest, HTTPCreated, HTTPConflict, HTTPNotFound, HTTPNotImplemented, HTTPOk
 from wsgiref.simple_server import make_server
 
 # OpenAPI definition employ 'Extended<>' variants that provide more features over original colander types
@@ -52,33 +54,34 @@ from cornice_swagger.common import (
     UUID,
     SLUG,
     # extra validators
+    OneOfEnum as OneOf,    # exactly the same as 'colander.OneOf', but also accepts direct Enum as input
     OneOfCaseInsensitive,  # ignore case for matching a string
     SemanticVersion,  # <major>.<minor>.<patch> strings
     StringRange,  # just like range, but can use numerical strings
 )
 
 
-
-#########################################################
+##################################################################################################################
 # Examples
-#########################################################
+#   Load contents with file names as keys for easier reference later in examples.
+#   Examples are used to provide explicit content of a request or response body.
+##################################################################################################################
 
-# load examples by file names as keys
-SCHEMA_EXAMPLE_DIR = os.path.join(os.path.dirname(__file__), "examples")
+SCHEMA_EXAMPLE_DIR = os.path.join(os.path.dirname(__file__), "schema-examples")
 EXAMPLES = {}
 for name in os.listdir(SCHEMA_EXAMPLE_DIR):
     path = os.path.join(SCHEMA_EXAMPLE_DIR, name)
     ext = os.path.splitext(name)[-1]
     with open(path, "r") as f:
         if ext in [".json", ".yaml", ".yml"]:
-            EXAMPLES[name] = yaml.safe_load(f)  # both JSON/YAML
+            EXAMPLES[name] = {"path": path, "data": yaml.safe_load(f)}  # both JSON/YAML
         else:
-            EXAMPLES[name] = f.read()
+            EXAMPLES[name] = {"path": path, "data": f.read()}  # raw content (text value, XML)
 
 
-#########################################################
+##################################################################################################################
 # API tags and metadata
-#########################################################
+##################################################################################################################
 
 API_TITLE = "OpenAPI Demo"
 API_INFO = {
@@ -95,10 +98,10 @@ TAG_JOBS = "Jobs"
 TAG_PROCESSES = "Processes"
 TAG_DEPRECATED = "Deprecated Endpoints"
 
-###############################################################################
+##################################################################################################################
 # API endpoints
 # These "services" are wrappers that allow Cornice to generate the JSON API
-###############################################################################
+##################################################################################################################
 
 api_frontpage_service = Service(name="api_frontpage", path="/")
 api_openapi_ui_service = Service(name="api_openapi_ui", path="/api")
@@ -110,11 +113,14 @@ job_service = Service(name="job", path=jobs_service.path + "/{job_id}")
 processes_service = Service(name="processes", path="/processes")
 process_service = Service(name="process", path=processes_service.path + "/{process_id}")
 
+xml_service = Service(name="xml", path="/xml")
 
-######################################################
-# Repetitive constants
 
-######################################################
+##################################################################################################################
+# Repetitive constants / enum
+#   Those can be used to generate validators and more specific schema types, 
+#   while using them for other code operations in the API implementation. 
+##################################################################################################################
 
 class ContentType(enum.Enum):
     APP_JSON = "application/json"
@@ -124,20 +130,30 @@ class ContentType(enum.Enum):
     TXT_PLAIN = "text/plain"
     ANY = "*/*"
 
+
 class AcceptLanguage(enum.Enum):
     EN_CA = "en-CA"
     EN_US = "en-US"
     FR_CA = "fr-CA"
 
 
+class JobStatuses(enum.Enum):
+    """Statuses of jobs execution."""
+    ACCEPTED = "accepted"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILURE = "failure"
+
+
 class Sorting(enum.Enum):
+    """Sorting methods of jobs."""
     ASCENDING = "asc"
     DESCENDING = "desc"
 
 
-#########################################################
+##################################################################################################################
 # Generic schemas
-#########################################################
+##################################################################################################################
 
 
 class ReferenceURL(AnyOfKeywordSchema):
@@ -176,24 +192,25 @@ class ContentTypeHeader(ExtendedSchemaNode):
     schema_type = String
 
 
+# we can define Enums schemas from real Python Enum definitions
+# two variants are possible, both will result in corresponding 'enum' values when generating the OpenAPI schemas
+
+
 class AcceptHeader(ExtendedSchemaNode):
-    # ok to use 'name' in this case because target 'key' in the mapping must
-    # be that specific value but cannot have a field named with this format
-    name = "Accept"
-    schema_type = String
-    validator = OneOf(ContentType)
+    name = "Accept"  # see above
+    enum_cls = ContentType
+    schema_type = Enum  # in this case, we employ the 'colander.Enum' approach to populate allowed members
+    attr = "value"  # default is to use 'name', but we use the 'value'
     missing = drop
-    default = ContentType.APP_JSON.value  # defaults to JSON for easy use within browsers
+    default = ContentType.APP_JSON.value  # must be one of the 'ContentType' enum, or it will raise at creation
 
 
 class AcceptLanguageHeader(ExtendedSchemaNode):
-    # ok to use 'name' in this case because target 'key' in the mapping must
-    # be that specific value but cannot have a field named with this format
-    name = "Accept-Language"
-    schema_type = String
+    name = "Accept-Language"  # see above
+    schema_type = String  # In this case, we use the String/Validator approach. Result will be similar to above
+    validator = OneOf(AcceptLanguage)  # values are used automatically, otherwise pass 'attr="name"'
     missing = drop
-    default = AcceptLanguage.EN_CA.value
-    validator = OneOf(AcceptLanguage)
+    default = AcceptLanguage.EN_CA.value  # again, must be one of the real values, or fails at instantiation time
 
 
 class JsonHeader(ExtendedMappingSchema):
@@ -201,7 +218,7 @@ class JsonHeader(ExtendedMappingSchema):
 
 
 class HtmlHeader(ExtendedMappingSchema):
-    content_type = ContentTypeHeader(example=ContentType.TEXT_HTML.value, default=ContentType.TEXT_HTML.value)
+    content_type = ContentTypeHeader(example=ContentType.TXT_HTML.value, default=ContentType.TXT_HTML.value)
 
 
 class XmlHeader(ExtendedMappingSchema):
@@ -328,7 +345,7 @@ class FormatDefault(Format):
     one of the known formats by this instance. When executing a job, the best match will be used
     to run the process, and will fallback to the default as last resort.
     """
-    mimeType = ExtendedSchemaNode(String(), default=ContentType.TEXT_PLAIN, example=ContentType.APP_XML.value)
+    mimeType = ExtendedSchemaNode(String(), default=ContentType.TXT_PLAIN, example=ContentType.APP_XML.value)
 
 
 class FormatExtra(ExtendedMappingSchema):
@@ -346,8 +363,7 @@ class FormatDescription(FormatDefault, FormatExtra):
 
 
 class FormatMedia(FormatExtra):
-    """Format employed for reference results respecting 'OGC-API - Processes' schemas."""
-    schema_ref = "{}/master/core/openapi/schemas/formatDescription.yaml".format(OGC_API_SCHEMA_URL)
+    """Format employed to represent data MIME-type schemas."""
     mediaType = ExtendedSchemaNode(String())
     schema = ExtendedSchemaNode(String(), missing=drop)
     encoding = ExtendedSchemaNode(String(), missing=drop)
@@ -390,10 +406,10 @@ class AdditionalParametersList(ExtendedSequenceSchema):
 
 
 class Content(ExtendedMappingSchema):
-    href = ReferenceURL(description="URL to CWL file.", title="OWSContentURL",
+    href = ReferenceURL(description="URL to file.", title="AppContentURL",
                         default=drop,       # if invalid, drop it completely,
                         missing=required,   # but still mark as 'required' for parent objects
-                        example="http://some.host/applications/cwl/multisensor_ndvi.cwl")
+                        example="http://some.host/path/somefile.json")
 
 
 class Offering(ExtendedMappingSchema):
@@ -401,9 +417,9 @@ class Offering(ExtendedMappingSchema):
     content = Content()
 
 
-class OWSContext(ExtendedMappingSchema):
+class AppContext(ExtendedMappingSchema):
     description = "OGC Web Service definition from an URL reference."
-    title = "owsContext"
+    title = "AppContext"
     offering = Offering()
 
 
@@ -413,8 +429,8 @@ class DescriptionBase(ExtendedMappingSchema):
     links = LinkList(missing=drop, description="References to endpoints with information related to the process.")
 
 
-class DescriptionOWS(ExtendedMappingSchema):
-    owsContext = OWSContext(missing=drop)
+class DescriptionApp(ExtendedMappingSchema):
+    AppContext = AppContext(missing=drop)
 
 
 class DescriptionExtra(ExtendedMappingSchema):
@@ -438,10 +454,12 @@ class ProcessDescriptionMeta(ExtendedMappingSchema):
 class ProcessDeployMeta(ExtendedMappingSchema):
     # don't require fields at all for process deployment, default to empty if omitted
     keywords = KeywordList(
-        missing=drop, default=[],
+        missing=drop,
+        default=[],
         description="Keywords applied to the process for search and categorization purposes.")
     metadata = MetadataList(
-        missing=drop, default=[],
+        missing=drop,
+        default=[],
         description="External references to documentation or metadata sources relevant to the process.")
 
 
@@ -484,16 +502,18 @@ class WithMinMaxOccurs(ExtendedMappingSchema):
     maxOccurs = MaxOccursDefinition(missing=drop)
 
 
-class ProcessDescriptionType(DescriptionType, DescriptionOWS):
+class ProcessDescriptionType(DescriptionType, DescriptionApp):
     id = ProcessIdentifier()
+    version = Version(missing=drop)
+    created = ExtendedSchemaNode(DateTime(), description="Creation date and time of the quote in ISO-8601 format.")
 
 
 class InputIdentifierType(ExtendedMappingSchema):
-    id = AnyIdentifier(description=IO_INFO_IDS.format(first="WPS", second="CWL", what="input"))
+    id = AnyIdentifier(description="Identifier of the input.")
 
 
 class OutputIdentifierType(ExtendedMappingSchema):
-    id = AnyIdentifier(description=IO_INFO_IDS.format(first="WPS", second="CWL", what="output"))
+    id = AnyIdentifier(description="Identifier of the output.")
 
 
 class InputDescriptionType(InputIdentifierType, DescriptionType, InputOutputDescriptionMeta):
@@ -530,7 +550,6 @@ class LiteralReference(ExtendedMappingSchema):
 
 
 class NameReferenceType(ExtendedMappingSchema):
-    schema_ref = "{}/master/core/openapi/schemas/nameReferenceType.yaml".format(OGC_API_SCHEMA_URL)
     name = ExtendedSchemaNode(String())
     reference = ReferenceURL(missing=drop)
 
@@ -665,6 +684,37 @@ class BoundingBoxOutputType(ExtendedMappingSchema):
     supportedCRS = SupportedCRSList()
 
 
+class ComplexOutputType(WithFormats):
+    pass
+
+
+class OutputTypeDefinition(OneOfKeywordSchema):
+    _one_of = [
+        BoundingBoxOutputType,
+        ComplexOutputType,  # should be 2nd to last because very permissive, but requires format at least
+        LiteralOutputType,  # must be last because it's the most permissive (all can default if omitted)
+    ]
+
+
+class OutputType(AnyOfKeywordSchema):
+    _any_of = [
+        OutputTypeDefinition(),
+        OutputDescriptionType(),
+    ]
+
+
+class OutputDescriptionList(ExtendedSequenceSchema):
+    output = OutputType()
+
+
+class JobStatusEnum(ExtendedSchemaNode):
+    schema_type = String
+    title = "JobStatus"
+    default = JobStatuses.ACCEPTED.value
+    example = JobStatuses.SUCCESS.value
+    validator = OneOf(JobStatuses)
+
+
 class JobSortEnum(ExtendedSchemaNode):
     schema_type = String
     title = "JobSortingMethod"
@@ -673,42 +723,24 @@ class JobSortEnum(ExtendedSchemaNode):
     validator = OneOf(Sorting)
 
 
-#########################################################
-# Path parameter definitions
-#########################################################
-
-
-class ProcessPath(ExtendedMappingSchema):
-    process_id = AnyIdentifier(description="Process identifier (SLUG or UUID).", example="my-rrocess")
-
-
-class JobPath(ExtendedMappingSchema):
-    job_id = UUID(description="Job ID", example="14c68477-c3ed-4784-9c0f-a4c9e1344db5")
-
-
-#########################################################
-# These classes define each of the endpoints parameters
-#########################################################
-
-
-class FrontpageEndpoint(ExtendedMappingSchema):
-    header = RequestHeaders()
-
-
-class OpenAPIEndpoint(ExtendedMappingSchema):
-    header = RequestHeaders()
-
-
-class SwaggerUIEndpoint(ExtendedMappingSchema):
-    pass
-
+##################################################################################################################
+# XML schemas
+#   OpenAPI v3 supports XML object definitions, with attributes, namespaces and prefixes
+#   Those are also supported by cornice-swagger, using 'XMLObject' schema as base.
+#   See its documentation for more details about each attribute it supports.
+##################################################################################################################
 
 class XMLNamespace(XMLObject):
     prefix = "xml"
 
 
 class AppNamespace(XMLObject):
-    """Custom namespace for demo app."""
+    """Custom namespace for demo app.
+
+    All XML object classes that inherit from this schema will be generated with the corresponding prefix.
+    For example, class named ``Example`` would be with XML namespace ``app:Example``,
+    where ``app`` prefix would correspond to XML namespace located at below URL.
+    """
     prefix = "app"
     namespace = "https://www.demo-app.com/schemas"
 
@@ -744,13 +776,13 @@ class AppVersion(ExtendedSchemaNode, AppNamespace):
     example = "1.0.0"
 
 
-class OWSAcceptVersions(ExtendedSequenceSchema, OWSNamespace):
+class AppAcceptVersions(ExtendedSequenceSchema, AppNamespace):
     description = "Accepted versions to produce the response."
     name = "AcceptVersions"
     item = AppVersion()
 
 
-class OWSLanguage(ExtendedSchemaNode, OWSNamespace):
+class AppLanguage(ExtendedSchemaNode, AppNamespace):
     description = "Desired language to produce the response."
     schema_type = String
     name = "Language"
@@ -758,30 +790,13 @@ class OWSLanguage(ExtendedSchemaNode, OWSNamespace):
     example = AcceptLanguage.EN_CA.value
 
 
-class OWSLanguageAttribute(OWSLanguage):
+class LanguageAttribute(AppLanguage):
     description = "RFC-4646 language code of the human-readable text."
     name = "language"
     attribute = True
 
 
-class OWSService(ExtendedSchemaNode, OWSNamespace):
-    description = "Desired service to produce the response (SHOULD be 'WPS')."
-    schema_type = String
-    name = "service"
-    attribute = True
-    default = AcceptLanguage.EN_US.value
-    example = AcceptLanguage.EN_CA.value
-
-
-class WPSServiceAttribute(ExtendedSchemaNode, XMLObject):
-    schema_type = String
-    name = "service"
-    attribute = True
-    default = "WPS"
-    example = "WPS"
-
-
-class WPSVersionAttribute(ExtendedSchemaNode, XMLObject):
+class AppVersionAttribute(ExtendedSchemaNode, XMLObject):
     schema_type = String
     name = "version"
     attribute = True
@@ -789,7 +804,7 @@ class WPSVersionAttribute(ExtendedSchemaNode, XMLObject):
     example = "1.0.0"
 
 
-class WPSLanguageAttribute(ExtendedSchemaNode, XMLNamespace):
+class AppLanguageAttribute(ExtendedSchemaNode, XMLNamespace):
     schema_type = String
     name = "lang"
     attribute = True
@@ -797,10 +812,10 @@ class WPSLanguageAttribute(ExtendedSchemaNode, XMLNamespace):
     example = AcceptLanguage.EN_CA.value
 
 
-class WPSParameters(ExtendedMappingSchema):
-    service = ExtendedSchemaNode(String(), example="WPS", description="Service selection.",
-                                 validator=OneOfCaseInsensitive(["WPS"]))
-    request = ExtendedSchemaNode(String(), example="GetCapabilities", description="WPS operation to accomplish",
+class AppParameters(ExtendedMappingSchema):
+    service = ExtendedSchemaNode(String(), example="App", description="Service selection.",
+                                 validator=OneOfCaseInsensitive(["App"]))
+    request = ExtendedSchemaNode(String(), example="GetCapabilities", description="App operation to accomplish",
                                  validator=OneOfCaseInsensitive(["GetCapabilities", "DescribeProcess", "Execute"]))
     version = Version(exaple="1.0.0", default="1.0.0", validator=OneOf(["1.0.0", "2.0.0", "2.0"]))
     identifier = ExtendedSchemaNode(String(), exaple="hello", missing=drop,
@@ -812,112 +827,106 @@ class WPSParameters(ExtendedMappingSchema):
                                      description="Process execution inputs provided as Key-Value Pairs (KVP).")
 
 
-class WPSOperationGetNoContent(ExtendedMappingSchema):
+class AppOperationGetNoContent(ExtendedMappingSchema):
     description = "No content body provided (GET requests)."
     default = {}
 
 
-class WPSOperationPost(ExtendedMappingSchema):
-    schema_ref = "http://schemas.opengis.net/wps/1.0.0/common/RequestBaseType.xsd"
-    accepted_versions = OWSAcceptVersions(missing=drop, default="1.0.0")
-    language = OWSLanguageAttribute(missing=drop)
-    service = OWSService()
+class AppOperationPost(ExtendedMappingSchema):
+    accepted_versions = AppAcceptVersions(missing=drop, default="1.0.0")
+    language = AppLanguageAttribute(missing=drop)
 
 
-class WPSGetCapabilitiesPost(WPSOperationPost, WPSNamespace):
-    schema_ref = "http://schemas.opengis.net/wps/1.0.0/wpsGetCapabilities_request.xsd"
+class AppGetCapabilitiesPost(AppOperationPost, AppNamespace):
     name = "GetCapabilities"
     title = "GetCapabilities"
 
 
-class OWSIdentifier(ExtendedSchemaNode, OWSNamespace):
+class AppIdentifier(ExtendedSchemaNode, AppNamespace):
     schema_type = String
     name = "Identifier"
 
 
-class OWSIdentifierList(ExtendedSequenceSchema, OWSNamespace):
+class AppIdentifierList(ExtendedSequenceSchema, AppNamespace):
     name = "Identifiers"
-    item = OWSIdentifier()
+    item = AppIdentifier()
 
 
-class OWSTitle(ExtendedSchemaNode, OWSNamespace):
+class AppTitle(ExtendedSchemaNode, AppNamespace):
     schema_type = String
     name = "Title"
 
 
-class OWSAbstract(ExtendedSchemaNode, OWSNamespace):
+class AppAbstract(ExtendedSchemaNode, AppNamespace):
     schema_type = String
     name = "Abstract"
 
 
-class OWSMetadataLink(ExtendedSchemaNode, XMLObject):
+class AppMetadataLink(ExtendedSchemaNode, XMLObject):
     schema_name = "Metadata"
     schema_type = String
     attribute = True
     name = "Metadata"
     prefix = "xlink"
-    example = "WPS"
+    example = "App"
     wrapped = False  # metadata xlink at same level as other items
 
 
-class OWSMetadata(ExtendedSequenceSchema, OWSNamespace):
+class AppMetadata(ExtendedSequenceSchema, AppNamespace):
     schema_type = String
     name = "Metadata"
-    title = OWSMetadataLink(missing=drop)
+    title = AppMetadataLink(missing=drop)
 
 
-class WPSDescribeProcessPost(WPSOperationPost, WPSNamespace):
-    schema_ref = "http://schemas.opengis.net/wps/1.0.0/wpsDescribeProcess_request.xsd"
+class AppDescribeProcessPost(AppOperationPost, AppNamespace):
     name = "DescribeProcess"
     title = "DescribeProcess"
-    identifier = OWSIdentifierList(
+    identifier = AppIdentifierList(
         description="Single or comma-separated list of process identifier to describe.",
         example="example"
     )
 
 
-class WPSExecuteDataInputs(ExtendedMappingSchema, WPSNamespace):
-    description = "XML data inputs provided for WPS POST request (Execute)."
+class AppExecuteDataInputs(ExtendedMappingSchema, AppNamespace):
+    description = "XML data inputs provided for App POST request (Execute)."
     name = "DataInputs"
     title = "DataInputs"
-    # FIXME: missing details about 'DataInputs'
 
 
-class WPSExecutePost(WPSOperationPost, WPSNamespace):
-    schema_ref = "http://schemas.opengis.net/wps/1.0.0/wpsExecute_request.xsd"
+class AppExecutePost(AppOperationPost, AppNamespace):
     name = "Execute"
     title = "Execute"
-    identifier = OWSIdentifier(description="Identifier of the process to execute with data inputs.")
-    dataInputs = WPSExecuteDataInputs(description="Data inputs to be provided for process execution.")
+    identifier = AppIdentifier(description="Identifier of the process to execute with data inputs.")
+    dataInputs = AppExecuteDataInputs(description="Data inputs to be provided for process execution.")
 
 
-class WPSRequestBody(OneOfKeywordSchema):
+class AppRequestBody(OneOfKeywordSchema):
     _one_of = [
-        WPSExecutePost(),
-        WPSDescribeProcessPost(),
-        WPSGetCapabilitiesPost(),
+        AppExecutePost(),
+        AppDescribeProcessPost(),
+        AppGetCapabilitiesPost(),
     ]
     examples = {
         "Execute": {
             "summary": "Execute request example.",
-            "value": EXAMPLES["wps_execute_request.xml"]
+            "value": EXAMPLES["wps_execute_request.xml"]["data"]
         }
     }
 
 
-class WPSHeaders(ExtendedMappingSchema):
+class AppHeaders(ExtendedMappingSchema):
     accept = AcceptHeader(missing=drop)
 
 
-class WPSEndpointGet(ExtendedMappingSchema):
-    header = WPSHeaders()
-    querystring = WPSParameters()
-    body = WPSOperationGetNoContent(missing=drop)
+class AppEndpointGet(ExtendedMappingSchema):
+    header = AppHeaders()
+    querystring = AppParameters()
+    body = AppOperationGetNoContent(missing=drop)
 
 
-class WPSEndpointPost(ExtendedMappingSchema):
-    header = WPSHeaders()
-    body = WPSRequestBody()
+class AppEndpointPost(ExtendedMappingSchema):
+    header = AppHeaders()
+    body = AppRequestBody()
 
 
 class XMLBooleanAttribute(ExtendedSchemaNode, XMLObject):
@@ -929,16 +938,16 @@ class XMLString(ExtendedSchemaNode, XMLObject):
     schema_type = String
 
 
-class OWSString(ExtendedSchemaNode, OWSNamespace):
+class AppString(ExtendedSchemaNode, AppNamespace):
     schema_type = String
 
 
-class OWSKeywordList(ExtendedSequenceSchema, OWSNamespace):
-    title = "OWSKeywords"
-    keyword = OWSString(name="Keyword", title="OWSKeyword", example="Weaver")
+class AppKeywordList(ExtendedSequenceSchema, AppNamespace):
+    title = "AppKeywords"
+    keyword = AppString(name="Keyword", title="AppKeyword", example="Weaver")
 
 
-class OWSType(ExtendedMappingSchema, OWSNamespace):
+class AppType(ExtendedMappingSchema, AppNamespace):
     schema_type = String
     name = "Type"
     example = "theme"
@@ -951,69 +960,69 @@ class OWSType(ExtendedMappingSchema, OWSNamespace):
     }
 
 
-class OWSPhone(ExtendedMappingSchema, OWSNamespace):
+class AppPhone(ExtendedMappingSchema, AppNamespace):
     name = "Phone"
-    voice = OWSString(name="Voice", title="OWSVoice", example="1-234-567-8910", missing=drop)
-    facsimile = OWSString(name="Facsimile", title="OWSFacsimile", missing=drop)
+    voice = AppString(name="Voice", title="AppVoice", example="1-234-567-8910", missing=drop)
+    facsimile = AppString(name="Facsimile", title="AppFacsimile", missing=drop)
 
 
-class OWSAddress(ExtendedMappingSchema, OWSNamespace):
+class AppAddress(ExtendedMappingSchema, AppNamespace):
     name = "Address"
-    delivery_point = OWSString(name="DeliveryPoint", title="OWSDeliveryPoint",
+    delivery_point = AppString(name="DeliveryPoint", title="AppDeliveryPoint",
                                example="123 Place Street", missing=drop)
-    city = OWSString(name="City", title="OWSCity", example="Nowhere", missing=drop)
-    country = OWSString(name="Country", title="OWSCountry", missing=drop)
-    admin_area = OWSString(name="AdministrativeArea", title="AdministrativeArea", missing=drop)
-    postal_code = OWSString(name="PostalCode", title="OWSPostalCode", example="A1B 2C3", missing=drop)
-    email = OWSString(name="ElectronicMailAddress", title="OWSElectronicMailAddress",
+    city = AppString(name="City", title="AppCity", example="Nowhere", missing=drop)
+    country = AppString(name="Country", title="AppCountry", missing=drop)
+    admin_area = AppString(name="AdministrativeArea", title="AdministrativeArea", missing=drop)
+    postal_code = AppString(name="PostalCode", title="AppPostalCode", example="A1B 2C3", missing=drop)
+    email = AppString(name="ElectronicMailAddress", title="AppElectronicMailAddress",
                       example="mail@me.com", validator=Email, missing=drop)
 
 
-class OWSContactInfo(ExtendedMappingSchema, OWSNamespace):
+class AppContactInfo(ExtendedMappingSchema, AppNamespace):
     name = "ContactInfo"
-    phone = OWSPhone(missing=drop)
-    address = OWSAddress(missing=drop)
+    phone = AppPhone(missing=drop)
+    address = AppAddress(missing=drop)
 
 
-class OWSServiceContact(ExtendedMappingSchema, OWSNamespace):
+class AppServiceContact(ExtendedMappingSchema, AppNamespace):
     name = "ServiceContact"
-    individual = OWSString(name="IndividualName", title="OWSIndividualName", example="John Smith", missing=drop)
-    position = OWSString(name="PositionName", title="OWSPositionName", example="One Man Team", missing=drop)
-    contact = OWSContactInfo(missing=drop, default={})
+    individual = AppString(name="IndividualName", title="AppIndividualName", example="John Smith", missing=drop)
+    position = AppString(name="PositionName", title="AppPositionName", example="One Man Team", missing=drop)
+    contact = AppContactInfo(missing=drop, default={})
 
 
-class OWSServiceProvider(ExtendedMappingSchema, OWSNamespace):
+class AppServiceProvider(ExtendedMappingSchema, AppNamespace):
     description = "Details about the institution providing the service."
     name = "ServiceProvider"
     title = "ServiceProvider"
-    provider_name = OWSString(name="ProviderName", title="OWSProviderName", example="EXAMPLE")
-    provider_site = OWSString(name="ProviderName", title="OWSProviderName", example="http://schema-example.com")
-    contact = OWSServiceContact(required=False, defalult={})
+    provider_name = AppString(name="ProviderName", title="AppProviderName", example="EXAMPLE")
+    provider_site = AppString(name="ProviderName", title="AppProviderName", example="http://schema-example.com")
+    contact = AppServiceContact(required=False, defalult={})
 
 
-class WPSDescriptionType(ExtendedMappingSchema, OWSNamespace):
-    schema_ref = "http://schemas.opengis.net/wps/1.0.0/common/DescriptionType.xsd"
+class AppDescriptionType(ExtendedMappingSchema, AppNamespace):
     name = "DescriptionType"
-    _title = OWSTitle(description="Title of the service.", example="Weaver")
-    abstract = OWSAbstract(description="Detail about the service.", example="Weaver WPS example schema.", missing=drop)
-    metadata = OWSMetadata(description="Metadata of the service.", example="Weaver WPS example schema.", missing=drop)
+    # below '_title' is to avoid conflict with 'title' that is employed by schema classes to generate their '$ref'
+    _title = AppTitle(description="Title of the service.", example="Weaver")
+    abstract = AppAbstract(description="Detail about the service.", example="Weaver App example schema.", missing=drop)
+    metadata = AppMetadata(description="Metadata of the service.", example="Weaver App example schema.", missing=drop)
 
 
-class OWSServiceIdentification(WPSDescriptionType, OWSNamespace):
+class AppServiceIdentification(AppDescriptionType, AppNamespace):
     name = "ServiceIdentification"
     title = "ServiceIdentification"
-    keywords = OWSKeywordList(name="Keywords")
-    type = OWSType()
-    svc_type = OWSString(name="ServiceType", title="ServiceType", example="WPS")
-    svc_type_ver1 = OWSString(name="ServiceTypeVersion", title="ServiceTypeVersion", example="1.0.0")
-    svc_type_ver2 = OWSString(name="ServiceTypeVersion", title="ServiceTypeVersion", example="2.0.0")
-    fees = OWSString(name="Fees", title="Fees", example="NONE", missing=drop, default="NONE")
-    access = OWSString(name="AccessConstraints", title="AccessConstraints",
+    keywords = AppKeywordList(name="Keywords")
+    type = AppType()
+    svc_type = AppString(name="ServiceType", title="ServiceType", example="App")
+    svc_type_ver1 = AppString(name="ServiceTypeVersion", title="ServiceTypeVersion", example="1.0.0")
+    svc_type_ver2 = AppString(name="ServiceTypeVersion", title="ServiceTypeVersion", example="2.0.0")
+    fees = AppString(name="Fees", title="Fees", example="NONE", missing=drop, default="NONE")
+    access = AppString(name="AccessConstraints", title="AccessConstraints",
                        example="NONE", missing=drop, default="NONE")
-    provider = OWSServiceProvider()
+    provider = AppServiceProvider()
 
 
-class OWSOperationName(ExtendedSchemaNode, OWSNamespace):
+class AppOperationName(ExtendedSchemaNode, AppNamespace):
     schema_type = String
     attribute = True
     name = "name"
@@ -1026,229 +1035,226 @@ class OperationLink(ExtendedSchemaNode, XMLObject):
     attribute = True
     name = "href"
     prefix = "xlink"
-    example = "http://schema-example.com/wps"
+    example = "http://schema-example.com/App"
 
 
-class OperationRequest(ExtendedMappingSchema, OWSNamespace):
+class OperationRequest(ExtendedMappingSchema, AppNamespace):
     href = OperationLink()
 
 
-class OWS_HTTP(ExtendedMappingSchema, OWSNamespace):
-    get = OperationRequest(name="Get", title="OWSGet")
-    post = OperationRequest(name="Post", title="OWSPost")
+class AppHTTP(ExtendedMappingSchema, AppNamespace):
+    get = OperationRequest(name="Get", title="AppGet")
+    post = OperationRequest(name="Post", title="AppPost")
 
 
-class OWS_DCP(ExtendedMappingSchema, OWSNamespace):
-    http = OWS_HTTP(name="HTTP", missing=drop)
-    https = OWS_HTTP(name="HTTPS", missing=drop)
+class AppDCP(ExtendedMappingSchema, AppNamespace):
+    http = AppHTTP(name="HTTP", missing=drop)
+    https = AppHTTP(name="HTTPS", missing=drop)
 
 
-class Operation(ExtendedMappingSchema, OWSNamespace):
-    name = OWSOperationName()
-    dcp = OWS_DCP()
+class Operation(ExtendedMappingSchema, AppNamespace):
+    name = AppOperationName()
+    dcp = AppDCP()
 
 
-class OperationsMetadata(ExtendedSequenceSchema, OWSNamespace):
+class OperationsMetadata(ExtendedSequenceSchema, AppNamespace):
     name = "OperationsMetadata"
     op = Operation()
 
 
-class ProcessVersion(ExtendedSchemaNode, WPSNamespace):
+class ProcessVersion(ExtendedSchemaNode, AppNamespace):
     schema_type = String
     attribute = True
 
 
-class OWSProcessSummary(ExtendedMappingSchema, WPSNamespace):
+class AppProcessSummary(ExtendedMappingSchema, AppNamespace):
+    name = "Process"
+    title = "Process"
+    _title = AppTitle(example="Example Process", description="Title of the process.")
     version = ProcessVersion(name="processVersion", default="None", example="1.2",
                              description="Version of the corresponding process summary.")
-    identifier = OWSIdentifier(example="example", description="Identifier to refer to the process.")
-    _title = OWSTitle(example="Example Process", description="Title of the process.")
-    abstract = OWSAbstract(example="Process for example schema.", description="Detail about the process.")
+    identifier = AppIdentifier(example="example", description="Identifier to refer to the process.")
+    abstract = AppAbstract(example="Process for example schema.", description="Detail about the process.")
 
 
-class WPSProcessOfferings(ExtendedSequenceSchema, WPSNamespace):
+class AppProcessOfferings(ExtendedSequenceSchema, AppNamespace):
     name = "ProcessOfferings"
     title = "ProcessOfferings"
-    process = OWSProcessSummary(name="Process")
+    process = AppProcessSummary(name="Process")
 
 
-class WPSLanguagesType(ExtendedSequenceSchema, WPSNamespace):
+class AppLanguagesType(ExtendedSequenceSchema, AppNamespace):
     title = "LanguagesType"
     wrapped = False
-    lang = OWSLanguage(name="Language")
+    lang = AppLanguage(name="Language")
 
 
-class WPSLanguageSpecification(ExtendedMappingSchema, WPSNamespace):
+class AppLanguageSpecification(ExtendedMappingSchema, AppNamespace):
     name = "Languages"
     title = "Languages"
-    default = OWSLanguage(name="Default")
-    supported = WPSLanguagesType(name="Supported")
+    default = AppLanguage(name="Default")
+    supported = AppLanguagesType(name="Supported")
 
 
-class WPSResponseBaseType(PermissiveMappingSchema, WPSNamespace):
-    schema_ref = "http://schemas.opengis.net/wps/1.0.0/common/ResponseBaseType.xsd"
-    service = WPSServiceAttribute()
-    version = WPSVersionAttribute()
-    lang = WPSLanguageAttribute()
+class AppResponseBaseType(PermissiveMappingSchema, AppNamespace):
+    version = AppVersionAttribute()
+    lang = AppLanguageAttribute()
 
 
-class WPSProcessVersion(ExtendedSchemaNode, WPSNamespace):
-    schema_ref = "http://schemas.opengis.net/wps/1.0.0/common/ProcessVersion.xsd"
+class AppProcessVersion(ExtendedSchemaNode, AppNamespace):
     schema_type = String
     description = "Release version of this Process."
     name = "processVersion"
     attribute = True
 
 
-class WPSInputDescriptionType(WPSDescriptionType):
-    identifier = OWSIdentifier(description="Unique identifier of the input.")
+class AppInputDescriptionType(AppDescriptionType):
+    identifier = AppIdentifier(description="Unique identifier of the input.")
     # override below to have different examples/descriptions
-    _title = OWSTitle(description="Human readable representation of the process input.")
-    abstract = OWSAbstract(missing=drop)
-    metadata = OWSMetadata(missing=drop)
+    _title = AppTitle(description="Human readable representation of the process input.")
+    abstract = AppAbstract(missing=drop)
+    metadata = AppMetadata(missing=drop)
 
 
-class WPSLiteralInputType(ExtendedMappingSchema, XMLObject):
+class AppLiteralInputType(ExtendedMappingSchema, XMLObject):
     pass
 
 
-class WPSLiteralData(WPSLiteralInputType):
+class AppLiteralData(AppLiteralInputType):
     name = "LiteralData"
 
 
-class WPSCRSsType(ExtendedMappingSchema, WPSNamespace):
+class AppCRSsType(ExtendedMappingSchema, AppNamespace):
     crs = XMLString(name="CRS", description="Coordinate Reference System")
 
 
-class WPSSupportedCRS(ExtendedSequenceSchema):
-    crs = WPSCRSsType(name="CRS")
+class AppSupportedCRS(ExtendedSequenceSchema):
+    crs = AppCRSsType(name="CRS")
 
 
-class WPSSupportedCRSType(ExtendedMappingSchema, WPSNamespace):
+class AppSupportedCRSType(ExtendedMappingSchema, AppNamespace):
     name = "SupportedCRSsType"
-    default = WPSCRSsType(name="Default")
-    supported = WPSSupportedCRS(name="Supported")
+    default = AppCRSsType(name="Default")
+    supported = AppSupportedCRS(name="Supported")
 
 
-class WPSBoundingBoxData(ExtendedMappingSchema, XMLObject):
-    data = WPSSupportedCRSType(name="BoundingBoxData")
+class AppBoundingBoxData(ExtendedMappingSchema, XMLObject):
+    data = AppSupportedCRSType(name="BoundingBoxData")
 
 
-class WPSFormatDefinition(ExtendedMappingSchema, XMLObject):
-    mime_type = XMLString(name="MimeType", default=ContentType.TEXT_PLAIN, example=ContentType.TEXT_PLAIN)
+class AppFormatDefinition(ExtendedMappingSchema, XMLObject):
+    mime_type = XMLString(name="MimeType", default=ContentType.TXT_PLAIN, example=ContentType.TXT_PLAIN)
     encoding = XMLString(name="Encoding", missing=drop, example="base64")
     schema = XMLString(name="Schema", missing=drop)
 
 
-class WPSFileFormat(ExtendedMappingSchema, XMLObject):
+class AppFileFormat(ExtendedMappingSchema, XMLObject):
     name = "Format"
-    format = WPSFormatDefinition()
+    format = AppFormatDefinition()
 
 
-class WPSFormatList(ExtendedSequenceSchema):
-    format = WPSFileFormat()
+class AppFormatList(ExtendedSequenceSchema):
+    format = AppFileFormat()
 
 
-class WPSComplexInputType(ExtendedMappingSchema, WPSNamespace):
+class AppComplexInputType(ExtendedMappingSchema, AppNamespace):
     max_mb = XMLString(name="maximumMegabytes", attribute=True)
-    defaults = WPSFileFormat(name="Default")
-    supported = WPSFormatList(name="Supported")
+    defaults = AppFileFormat(name="Default")
+    supported = AppFormatList(name="Supported")
 
 
-class WPSComplexData(ExtendedMappingSchema, XMLObject):
-    data = WPSComplexInputType(name="ComplexData")
+class AppComplexData(ExtendedMappingSchema, XMLObject):
+    data = AppComplexInputType(name="ComplexData")
 
 
-class WPSInputFormChoice(OneOfKeywordSchema):
+class AppInputFormChoice(OneOfKeywordSchema):
     title = "InputFormChoice"
     _one_of = [
-        WPSComplexData(),
-        WPSLiteralData(),
-        WPSBoundingBoxData(),
+        AppComplexData(),
+        AppLiteralData(),
+        AppBoundingBoxData(),
     ]
 
 
-class WPSMinOccursAttribute(MinOccursDefinition, XMLObject):
+class AppMinOccursAttribute(MinOccursDefinition, XMLObject):
     name = "minOccurs"
     attribute = True
 
 
-class WPSMaxOccursAttribute(MinOccursDefinition, XMLObject):
+class AppMaxOccursAttribute(MinOccursDefinition, XMLObject):
     name = "maxOccurs"
     prefix = drop
     attribute = True
 
 
-class WPSDataInputDescription(ExtendedMappingSchema):
-    min_occurs = WPSMinOccursAttribute()
-    max_occurs = WPSMaxOccursAttribute()
+class AppDataInputDescription(ExtendedMappingSchema):
+    min_occurs = AppMinOccursAttribute()
+    max_occurs = AppMaxOccursAttribute()
 
 
-class WPSDataInputItem(AllOfKeywordSchema, WPSNamespace):
+class AppDataInputItem(AllOfKeywordSchema, AppNamespace):
     _all_of = [
-        WPSInputDescriptionType(),
-        WPSInputFormChoice(),
-        WPSDataInputDescription(),
+        AppInputDescriptionType(),
+        AppInputFormChoice(),
+        AppDataInputDescription(),
     ]
 
 
-class WPSDataInputs(ExtendedSequenceSchema, WPSNamespace):
+class AppDataInputs(ExtendedSequenceSchema, AppNamespace):
     name = "DataInputs"
     title = "DataInputs"
-    input = WPSDataInputItem()
+    input = AppDataInputItem()
 
 
-class WPSOutputDescriptionType(WPSDescriptionType):
+class AppOutputDescriptionType(AppDescriptionType):
     name = "OutputDescriptionType"
     title = "OutputDescriptionType"
-    identifier = OWSIdentifier(description="Unique identifier of the output.")
+    identifier = AppIdentifier(description="Unique identifier of the output.")
     # override below to have different examples/descriptions
-    _title = OWSTitle(description="Human readable representation of the process output.")
-    abstract = OWSAbstract(missing=drop)
-    metadata = OWSMetadata(missing=drop)
+    _title = AppTitle(description="Human readable representation of the process output.")
+    abstract = AppAbstract(missing=drop)
+    metadata = AppMetadata(missing=drop)
 
 
-class ProcessOutputs(ExtendedSequenceSchema, WPSNamespace):
+class ProcessOutputs(ExtendedSequenceSchema, AppNamespace):
     name = "ProcessOutputs"
     title = "ProcessOutputs"
-    output = WPSOutputDescriptionType()
+    output = AppOutputDescriptionType()
 
 
-class WPSGetCapabilities(WPSResponseBaseType):
-    schema_ref = "http://schemas.opengis.net/wps/1.0.0/wpsGetCapabilities_response.xsd"
+class AppGetCapabilities(AppResponseBaseType):
     name = "Capabilities"
     title = "Capabilities"  # not to be confused by 'GetCapabilities' used for request
-    svc = OWSServiceIdentification()
+    svc = AppServiceIdentification()
     ops = OperationsMetadata()
-    offering = WPSProcessOfferings()
-    languages = WPSLanguageSpecification()
+    offering = AppProcessOfferings()
+    languages = AppLanguageSpecification()
 
 
-class WPSProcessDescriptionType(WPSResponseBaseType, WPSProcessVersion):
+class AppProcessDescriptionType(AppResponseBaseType, AppProcessVersion):
     name = "ProcessDescriptionType"
     description = "Description of the requested process by identifier."
     store = XMLBooleanAttribute(name="storeSupported", example=True, default=True)
     status = XMLBooleanAttribute(name="statusSupported", example=True, default=True)
-    inputs = WPSDataInputs()
+    inputs = AppDataInputs()
     outputs = ProcessOutputs()
 
 
-class WPSProcessDescriptionList(ExtendedSequenceSchema, WPSNamespace):
+class AppProcessDescriptionList(ExtendedSequenceSchema, AppNamespace):
     name = "ProcessDescriptions"
     title = "ProcessDescriptions"
     description = "Listing of process description for every requested identifier."
     wrapped = False
-    process = WPSProcessDescriptionType()
+    process = AppProcessDescriptionType()
 
 
-class WPSDescribeProcess(WPSResponseBaseType):
-    schema_ref = "http://schemas.opengis.net/wps/1.0.0/wpsDescribeProcess_response.xsd"
+class AppDescribeProcess(AppResponseBaseType):
     name = "DescribeProcess"
     title = "DescribeProcess"
-    process = WPSProcessDescriptionList()
+    process = AppProcessDescriptionList()
 
 
-class WPSStatusLocationAttribute(ExtendedSchemaNode, XMLObject):
+class AppStatusLocationAttribute(ExtendedSchemaNode, XMLObject):
     schema_type = String
     name = "statusLocation"
     prefix = drop
@@ -1256,7 +1262,7 @@ class WPSStatusLocationAttribute(ExtendedSchemaNode, XMLObject):
     format = "file"
 
 
-class WPSServiceInstanceAttribute(ExtendedSchemaNode, XMLObject):
+class AppServiceInstanceAttribute(ExtendedSchemaNode, XMLObject):
     schema_type = String
     name = "serviceInstance"
     prefix = drop
@@ -1272,189 +1278,182 @@ class CreationTimeAttribute(ExtendedSchemaNode, XMLObject):
     attribute = True
 
 
-class WPSStatusSuccess(ExtendedSchemaNode, WPSNamespace):
+class AppStatusSuccess(ExtendedSchemaNode, AppNamespace):
     schema_type = String
     name = "ProcessSucceeded"
     title = "ProcessSucceeded"
 
 
-class WPSStatusFailed(ExtendedSchemaNode, WPSNamespace):
+class AppStatusFailed(ExtendedSchemaNode, AppNamespace):
     schema_type = String
     name = "ProcessFailed"
     title = "ProcessFailed"
 
 
-class WPSStatus(ExtendedMappingSchema, WPSNamespace):
+class AppStatus(ExtendedMappingSchema, AppNamespace):
     name = "Status"
     title = "Status"
     creationTime = CreationTimeAttribute()
-    status_success = WPSStatusSuccess(missing=drop)
-    status_failed = WPSStatusFailed(missing=drop)
+    status_success = AppStatusSuccess(missing=drop)
+    status_failed = AppStatusFailed(missing=drop)
 
 
-class WPSProcessSummary(ExtendedMappingSchema, WPSNamespace):
-    name = "Process"
-    title = "Process"
-    identifier = OWSIdentifier()
-    _title = OWSTitle()
-    abstract = OWSAbstract(missing=drop)
+class AppOutputBase(ExtendedMappingSchema):
+    identifier = AppIdentifier()
+    _title = AppTitle()
+    abstract = AppAbstract(missing=drop)
 
 
-class WPSOutputBase(ExtendedMappingSchema):
-    identifier = OWSIdentifier()
-    _title = OWSTitle()
-    abstract = OWSAbstract(missing=drop)
-
-
-class WPSOutputDefinitionItem(WPSOutputBase, WPSNamespace):
+class AppOutputDefinitionItem(AppOutputBase, AppNamespace):
     name = "Output"
-    # use different title to avoid OpenAPI schema definition clash with 'Output' of 'WPSProcessOutputs'
+    # use different title to avoid OpenAPI schema definition clash with 'Output' of 'AppProcessOutputs'
     title = "OutputDefinition"
 
 
-class WPSOutputDefinitions(ExtendedSequenceSchema, WPSNamespace):
+class AppOutputDefinitions(ExtendedSequenceSchema, AppNamespace):
     name = "OutputDefinitions"
     title = "OutputDefinitions"
-    out_def = WPSOutputDefinitionItem()
+    out_def = AppOutputDefinitionItem()
 
 
-class WPSOutputLiteral(ExtendedMappingSchema):
+class AppOutputLiteral(ExtendedMappingSchema):
     data = ()
 
 
-class WPSReference(ExtendedMappingSchema, WPSNamespace):
+class AppReference(ExtendedMappingSchema, AppNamespace):
     href = XMLReferenceAttribute()
     mimeType = MimeTypeAttribute()
     encoding = EncodingAttribute()
 
 
-class WPSOutputReference(ExtendedMappingSchema):
+class AppOutputReference(ExtendedMappingSchema):
     title = "OutputReference"
-    reference = WPSReference(name="Reference")
+    reference = AppReference(name="Reference")
 
 
-class WPSOutputData(OneOfKeywordSchema):
+class AppOutputData(OneOfKeywordSchema):
     _one_of = [
-        WPSOutputLiteral(),
-        WPSOutputReference(),
+        AppOutputLiteral(),
+        AppOutputReference(),
     ]
 
 
-class WPSDataOutputItem(AllOfKeywordSchema, WPSNamespace):
+class AppDataOutputItem(AllOfKeywordSchema, AppNamespace):
     name = "Output"
-    # use different title to avoid OpenAPI schema definition clash with 'Output' of 'WPSOutputDefinitions'
+    # use different title to avoid OpenAPI schema definition clash with 'Output' of 'AppOutputDefinitions'
     title = "DataOutput"
     _all_of = [
-        WPSOutputBase(),
-        WPSOutputData(),
+        AppOutputBase(),
+        AppOutputData(),
     ]
 
 
-class WPSProcessOutputs(ExtendedSequenceSchema, WPSNamespace):
+class AppProcessOutputs(ExtendedSequenceSchema, AppNamespace):
     name = "ProcessOutputs"
     title = "ProcessOutputs"
-    output = WPSDataOutputItem()
+    output = AppDataOutputItem()
 
 
-class WPSExecuteResponse(WPSResponseBaseType, WPSProcessVersion):
-    schema_ref = "http://schemas.opengis.net/wps/1.0.0/wpsExecute_response.xsd"
+class AppExecuteResponse(AppResponseBaseType, AppProcessVersion):
     name = "ExecuteResponse"
     title = "ExecuteResponse"  # not to be confused by 'Execute' used for request
-    location = WPSStatusLocationAttribute()
-    svc_loc = WPSServiceInstanceAttribute()
-    process = WPSProcessSummary()
-    status = WPSStatus()
-    inputs = WPSDataInputs(missing=drop)          # when lineage is requested only
-    out_def = WPSOutputDefinitions(missing=drop)  # when lineage is requested only
-    outputs = WPSProcessOutputs()
+    location = AppStatusLocationAttribute()
+    svc_loc = AppServiceInstanceAttribute()
+    process = AppProcessSummary()
+    status = AppStatus()
+    inputs = AppDataInputs(missing=drop)  # when lineage is requested only
+    out_def = AppOutputDefinitions(missing=drop)  # when lineage is requested only
+    outputs = AppProcessOutputs()
 
 
-class WPSXMLSuccessBodySchema(OneOfKeywordSchema):
+class AppXMLSuccessBodySchema(OneOfKeywordSchema):
     _one_of = [
-        WPSGetCapabilities(),
-        WPSDescribeProcess(),
-        WPSExecuteResponse(),
+        AppGetCapabilities(),
+        AppDescribeProcess(),
+        AppExecuteResponse(),
     ]
 
 
-class OWSExceptionCodeAttribute(ExtendedSchemaNode, XMLObject):
+class AppExceptionCodeAttribute(ExtendedSchemaNode, XMLObject):
     schema_type = String
     name = "exceptionCode"
     title = "Exception"
     attribute = True
 
 
-class OWSExceptionLocatorAttribute(ExtendedSchemaNode, XMLObject):
+class AppExceptionLocatorAttribute(ExtendedSchemaNode, XMLObject):
     schema_type = String
     name = "locator"
     attribute = True
 
 
-class OWSExceptionText(ExtendedSchemaNode, OWSNamespace):
+class AppExceptionText(ExtendedSchemaNode, AppNamespace):
     schema_type = String
     name = "ExceptionText"
 
 
-class OWSException(ExtendedMappingSchema, OWSNamespace):
+class AppException(ExtendedMappingSchema, AppNamespace):
     name = "Exception"
     title = "Exception"
-    code = OWSExceptionCodeAttribute(example="MissingParameterValue")
-    locator = OWSExceptionLocatorAttribute(default="None", example="service")
-    text = OWSExceptionText(example="Missing service")
+    code = AppExceptionCodeAttribute(example="MissingParameterValue")
+    locator = AppExceptionLocatorAttribute(default="None", example="service")
+    text = AppExceptionText(example="Missing service")
 
 
-class OWSExceptionReport(ExtendedMappingSchema, OWSNamespace):
+class AppExceptionReport(ExtendedMappingSchema, AppNamespace):
     name = "ExceptionReport"
     title = "ExceptionReport"
-    exception = OWSException()
+    exception = AppException()
 
 
-class WPSException(ExtendedMappingSchema):
-    report = OWSExceptionReport()
+class AppError(ExtendedMappingSchema):
+    report = AppExceptionReport()
 
 
-class OkWPSResponse(ExtendedMappingSchema):
-    description = "WPS operation successful"
+class OkAppResponse(ExtendedMappingSchema):
+    description = "App operation successful"
     header = XmlHeader()
-    body = WPSXMLSuccessBodySchema()
+    body = AppXMLSuccessBodySchema()
 
 
-class ErrorWPSResponse(ExtendedMappingSchema):
-    description = "Unhandled error occurred on WPS endpoint."
+class ErrorAppResponse(ExtendedMappingSchema):
+    description = "Unhandled error occurred on App endpoint."
     header = XmlHeader()
-    body = WPSException()
+    body = AppError()
 
 
-class ProviderEndpoint(ProviderPath):
+##################################################################################################################
+# Path parameter definitions
+#   These will document the path parameters of corresponding requests that uses them.
+##################################################################################################################
+
+
+class ProcessPath(ExtendedMappingSchema):
+    process_id = AnyIdentifier(description="Process identifier (SLUG or UUID).", example="my-rrocess")
+
+
+class JobPath(ExtendedMappingSchema):
+    job_id = UUID(description="Job ID", example="14c68477-c3ed-4784-9c0f-a4c9e1344db5")
+
+
+##################################################################################################################
+# Request schemas
+##################################################################################################################
+
+
+class FrontpageEndpoint(ExtendedMappingSchema):
     header = RequestHeaders()
 
 
-class ProviderProcessEndpoint(ProviderPath, ProcessPath):
+class OpenAPIEndpoint(ExtendedMappingSchema):
     header = RequestHeaders()
+
+
+class SwaggerUIEndpoint(ExtendedMappingSchema):
+    pass
 
 
 class ProcessEndpoint(ProcessPath):
-    header = RequestHeaders()
-
-
-class ProcessPackageEndpoint(ProcessPath):
-    header = RequestHeaders()
-
-
-class ProcessPayloadEndpoint(ProcessPath):
-    header = RequestHeaders()
-
-
-class ProcessVisibilityGetEndpoint(ProcessPath):
-    header = RequestHeaders()
-
-
-class ProcessVisibilityPutEndpoint(ProcessPath):
-    header = RequestHeaders()
-    body = Visibility()
-
-
-class ProviderJobEndpoint(ProviderPath, ProcessPath, JobPath):
     header = RequestHeaders()
 
 
@@ -1466,10 +1465,6 @@ class ProcessInputsEndpoint(ProcessPath, JobPath):
     header = RequestHeaders()
 
 
-class ProviderInputsEndpoint(ProviderPath, ProcessPath, JobPath):
-    header = RequestHeaders()
-
-
 class JobInputsEndpoint(JobPath):
     header = RequestHeaders()
 
@@ -1478,20 +1473,11 @@ class ProcessOutputsEndpoint(ProcessPath, JobPath):
     header = RequestHeaders()
 
 
-class ProviderOutputsEndpoint(ProviderPath, ProcessPath, JobPath):
-    header = RequestHeaders()
-
-
 class JobOutputsEndpoint(JobPath):
     header = RequestHeaders()
 
 
 class ProcessResultEndpoint(ProcessOutputsEndpoint):
-    deprecated = True
-    header = RequestHeaders()
-
-
-class ProviderResultEndpoint(ProviderOutputsEndpoint):
     deprecated = True
     header = RequestHeaders()
 
@@ -1505,27 +1491,11 @@ class ProcessResultsEndpoint(ProcessPath, JobPath):
     header = RequestHeaders()
 
 
-class ProviderResultsEndpoint(ProviderPath, ProcessPath, JobPath):
-    header = RequestHeaders()
-
-
-class JobResultsEndpoint(ProviderPath, ProcessPath, JobPath):
-    header = RequestHeaders()
-
-
-class ProviderExceptionsEndpoint(ProviderPath, ProcessPath, JobPath):
-    header = RequestHeaders()
-
-
 class JobExceptionsEndpoint(JobPath):
     header = RequestHeaders()
 
 
 class ProcessExceptionsEndpoint(ProcessPath, JobPath):
-    header = RequestHeaders()
-
-
-class ProviderLogsEndpoint(ProviderPath, ProcessPath, JobPath):
     header = RequestHeaders()
 
 
@@ -1537,9 +1507,9 @@ class ProcessLogsEndpoint(ProcessPath, JobPath):
     header = RequestHeaders()
 
 
-##################################################################
-# These classes define schemas for requests that feature a body
-##################################################################
+##################################################################################################################
+# Schema classes that define requests and response body content
+##################################################################################################################
 
 
 class CreateProviderRequestBody(ExtendedMappingSchema):
@@ -1556,16 +1526,12 @@ class OutputDataType(OutputIdentifierType):
     format = Format(missing=drop)
 
 
-class Output(OutputDataType):
-    transmissionMode = TransmissionModeEnum(missing=drop)
-
-
 class OutputList(ExtendedSequenceSchema):
-    output = Output()
+    output = OutputDataType()
 
 
 class ProviderSummarySchema(ExtendedMappingSchema):
-    """WPS provider summary definition."""
+    """App provider summary definition."""
     id = ExtendedSchemaNode(String())
     url = URL(description="Endpoint of the provider.")
     title = ExtendedSchemaNode(String())
@@ -1574,21 +1540,13 @@ class ProviderSummarySchema(ExtendedMappingSchema):
 
 
 class ProviderCapabilitiesSchema(ExtendedMappingSchema):
-    """WPS provider capabilities."""
+    """App provider capabilities."""
     id = ExtendedSchemaNode(String())
-    url = URL(description="WPS GetCapabilities URL of the provider.")
+    url = URL(description="App GetCapabilities URL of the provider.")
     title = ExtendedSchemaNode(String())
     abstract = ExtendedSchemaNode(String())
     contact = ExtendedSchemaNode(String())
     type = ExtendedSchemaNode(String())
-
-
-class TransmissionModeList(ExtendedSequenceSchema):
-    transmissionMode = TransmissionModeEnum()
-
-
-class JobControlOptionsList(ExtendedSequenceSchema):
-    jobControlOption = JobControlOptionsEnum()
 
 
 class ExceptionReportType(ExtendedMappingSchema):
@@ -1597,10 +1555,7 @@ class ExceptionReportType(ExtendedMappingSchema):
 
 
 class ProcessSummary(ProcessDescriptionType, ProcessDescriptionMeta):
-    """WPS process definition."""
-    version = Version(missing=drop)
-    jobControlOptions = JobControlOptionsList(missing=[])
-    outputTransmission = TransmissionModeList(missing=[])
+    """App process definition."""
     processDescriptionURL = URL(description="Process description endpoint.",
                                 missing=drop, title="processDescriptionURL")
 
@@ -1620,26 +1575,10 @@ class ProcessInfo(ExtendedMappingSchema):
 class Process(ProcessInfo, ProcessDescriptionType, ProcessDescriptionMeta):
     inputs = InputTypeList(description="Inputs definition of the process.")
     outputs = OutputDescriptionList(description="Outputs definition of the process.")
-    visibility = VisibilityValue(missing=drop)
-
-
-class ProcessDeployment(ProcessDescriptionType, ProcessDeployMeta):
-    # allowed undefined I/O during deploy because of reference from owsContext or executionUnit
-    inputs = InputTypeList(
-        missing=drop, title="DeploymentInputs",
-        description="Additional definitions for process inputs to extend generated details by the referred package. "
-                    "These are optional as they can mostly be inferred from the 'executionUnit', but allow specific "
-                    "overrides (see '{}/package.html#correspondence-between-cwl-and-wps-fields')".format(DOC_URL))
-    outputs = OutputDescriptionList(
-        missing=drop, title="DeploymentInputs",
-        description="Additional definitions for process outputs to extend generated details by the referred package. "
-                    "These are optional as they can mostly be inferred from the 'executionUnit', but allow specific "
-                    "overrides (see '{}/package.html#correspondence-between-cwl-and-wps-fields')".format(DOC_URL))
-    visibility = VisibilityValue(missing=drop)
 
 
 class ProcessOutputDescriptionSchema(ExtendedMappingSchema):
-    """WPS process output definition."""
+    """App process output definition."""
     dataType = ExtendedSchemaNode(String())
     defaultValue = ExtendedMappingSchema()
     id = ExtendedSchemaNode(String())
@@ -1687,7 +1626,7 @@ class JobCollection(ExtendedSequenceSchema):
 
 
 class CreatedJobStatusSchema(ExtendedMappingSchema):
-    status = ExtendedSchemaNode(String(), example=STATUS_ACCEPTED)
+    status = ExtendedSchemaNode(String(), example=JobStatuses.ACCEPTED.value)
     location = ExtendedSchemaNode(String(), example="http://{host}/weaver/processes/{my-process-id}/jobs/{my-job-id}")
     jobID = UUID(description="ID of the created job.")
 
@@ -1740,36 +1679,12 @@ class DismissedJobSchema(ExtendedMappingSchema):
 class QuoteProcessParametersSchema(ExtendedMappingSchema):
     inputs = InputTypeList(missing=drop)
     outputs = OutputDescriptionList(missing=drop)
-    mode = JobExecuteModeEnum()
-    response = JobResponseOptionsEnum()
-
-
-class AlternateQuotation(ExtendedMappingSchema):
-    id = UUID(description="Quote ID.")
-    title = ExtendedSchemaNode(String(), description="Name of the quotation.", missing=drop)
-    description = ExtendedSchemaNode(String(), description="Description of the quotation.", missing=drop)
-    price = ExtendedSchemaNode(Float(), description="Process execution price.")
-    currency = ExtendedSchemaNode(String(), description="Currency code in ISO-4217 format.")
-    expire = ExtendedSchemaNode(DateTime(), description="Expiration date and time of the quote in ISO-8601 format.")
-    created = ExtendedSchemaNode(DateTime(), description="Creation date and time of the quote in ISO-8601 format.")
-    details = ExtendedSchemaNode(String(), description="Details of the quotation.", missing=drop)
-    estimatedTime = ExtendedSchemaNode(String(), description="Estimated process execution duration.", missing=drop)
-
-
-class AlternateQuotationList(ExtendedSequenceSchema):
-    step = AlternateQuotation(description="Quote of a workflow step process.")
-
-
-# same as base Format, but for process/job responses instead of process submission
-# (ie: 'Format' is for allowed/supported formats, this is the result format)
-class DataEncodingAttributes(Format):
-    pass
 
 
 class Reference(ExtendedMappingSchema):
     title = "Reference"
     href = ReferenceURL(description="Endpoint of the reference.")
-    format = DataEncodingAttributes(missing=drop)
+    format = Format(missing=drop)
     body = ExtendedSchemaNode(String(), missing=drop)
     bodyReference = ReferenceURL(missing=drop)
 
@@ -1777,12 +1692,13 @@ class Reference(ExtendedMappingSchema):
 class AnyType(OneOfKeywordSchema):
     """Permissive variants that we attempt to parse automatically."""
     _one_of = [
-        # literal data with 'data' key
+        # literal data with 'data' key (object as {"data": <the-value>})
         AnyLiteralDataType(),
-        # same with 'value' key (OGC specification)
+        # same with 'value' key (object as {"value": <the-value>})
         AnyLiteralValueType(),
-        # HTTP references with various keywords
+        # HTTP references key (object as {"reference": <some-URL>})
         LiteralReference(),
+        # HTTP references detail (object as {"href": <some-URL>, "format": {format-obj}, ...})
         Reference(),
     ]
 
@@ -1799,55 +1715,13 @@ class InputList(ExtendedSequenceSchema):
 
 
 class Execute(ExtendedMappingSchema):
-    # permit unspecified inputs for processes that could technically allow no-inputs definition (CWL),
-    # but very unlikely/unusual in real world scenarios (possible case: constant endpoint fetcher?)
-    inputs = InputList(missing=drop)
+    inputs = InputList()
     outputs = OutputList()
-    mode = JobExecuteModeEnum()
     notification_email = ExtendedSchemaNode(
         String(),
         missing=drop,
         validator=Email(),
         description="Optionally send a notification email when the job is done.")
-    response = JobResponseOptionsEnum()
-
-
-class QuoteProcessListSchema(ExtendedSequenceSchema):
-    step = Quotation(description="Quote of a workflow step process.")
-
-
-class QuoteSchema(ExtendedMappingSchema):
-    id = UUID(description="Quote ID.")
-    process = AnyIdentifier(description="Corresponding process ID.")
-    steps = QuoteProcessListSchema(description="Child processes and prices.")
-    total = ExtendedSchemaNode(Float(), description="Total of the quote including step processes.")
-
-
-class QuotationList(ExtendedSequenceSchema):
-    quote = ExtendedSchemaNode(String(), description="Quote ID.")
-
-
-class QuotationListSchema(ExtendedMappingSchema):
-    quotations = QuotationList()
-
-
-class BillSchema(ExtendedMappingSchema):
-    id = UUID(description="Bill ID.")
-    title = ExtendedSchemaNode(String(), description="Name of the bill.")
-    description = ExtendedSchemaNode(String(), missing=drop)
-    price = ExtendedSchemaNode(Float(), description="Price associated to the bill.")
-    currency = ExtendedSchemaNode(String(), description="Currency code in ISO-4217 format.")
-    created = ExtendedSchemaNode(DateTime(), description="Creation date and time of the bill in ISO-8601 format.")
-    userId = ExtendedSchemaNode(Integer(), description="User id that requested the quote.")
-    quotationId = UUID(description="Corresponding quote ID.", missing=drop)
-
-
-class BillList(ExtendedSequenceSchema):
-    bill = ExtendedSchemaNode(String(), description="Bill ID.")
-
-
-class BillListSchema(ExtendedMappingSchema):
-    bills = BillList()
 
 
 class SupportedValues(ExtendedMappingSchema):
@@ -1856,398 +1730,6 @@ class SupportedValues(ExtendedMappingSchema):
 
 class DefaultValues(ExtendedMappingSchema):
     pass
-
-
-class CWLClass(ExtendedSchemaNode):
-    # in this case it is ok to use 'name' because target fields receiving it will
-    # never be able to be named 'class' because of Python reserved keyword
-    name = "class"
-    title = "Class"
-    schema_type = String
-    example = "CommandLineTool"
-    validator = OneOf(["CommandLineTool", "ExpressionTool", "Workflow"])
-    description = (
-        "CWL class specification. This is used to differentiate between single Application Package (AP)"
-        "definitions and Workflow that chains multiple packages."
-    )
-
-
-class RequirementClass(ExtendedSchemaNode):
-    # in this case it is ok to use 'name' because target fields receiving it will
-    # never be able to be named 'class' because of Python reserved keyword
-    name = "class"
-    title = "RequirementClass"
-    schema_type = String
-    description = "CWL requirement class specification."
-
-
-class DockerRequirementSpecification(PermissiveMappingSchema):
-    dockerPull = ExtendedSchemaNode(
-        String(),
-        example="docker-registry.host.com/namespace/image:1.2.3",
-        title="Docker pull reference",
-        description="Reference package that will be retrieved and executed by CWL."
-    )
-
-
-class DockerRequirementMap(ExtendedMappingSchema):
-    DockerRequirement = DockerRequirementSpecification(
-        name=CWL_REQUIREMENT_APP_DOCKER,
-        title=CWL_REQUIREMENT_APP_DOCKER
-    )
-
-
-class DockerRequirementClass(DockerRequirementSpecification):
-    _class = RequirementClass(example=CWL_REQUIREMENT_APP_DOCKER, validator=OneOf([CWL_REQUIREMENT_APP_DOCKER]))
-
-
-class DockerGpuRequirementSpecification(DockerRequirementSpecification):
-    description = (
-        "Docker requirement with GPU-enabled support (https://github.com/NVIDIA/nvidia-docker). "
-        "The instance must have the NVIDIA toolkit installed to use this feature."
-    )
-
-
-class DockerGpuRequirementMap(ExtendedMappingSchema):
-    req = DockerGpuRequirementSpecification(name=CWL_REQUIREMENT_APP_DOCKER_GPU)
-
-
-class DockerGpuRequirementClass(DockerGpuRequirementSpecification):
-    title = CWL_REQUIREMENT_APP_DOCKER_GPU
-    _class = RequirementClass(example=CWL_REQUIREMENT_APP_DOCKER_GPU, validator=OneOf([CWL_REQUIREMENT_APP_DOCKER_GPU]))
-
-
-class DirectoryListing(PermissiveMappingSchema):
-    entry = ExtendedSchemaNode(String(), missing=drop)
-
-
-class InitialWorkDirListing(ExtendedSequenceSchema):
-    listing = DirectoryListing()
-
-
-class InitialWorkDirRequirementSpecification(PermissiveMappingSchema):
-    listing = InitialWorkDirListing()
-
-
-class InitialWorkDirRequirementMap(ExtendedMappingSchema):
-    req = InitialWorkDirRequirementSpecification(name=CWL_REQUIREMENT_INIT_WORKDIR)
-
-
-class InitialWorkDirRequirementClass(InitialWorkDirRequirementSpecification):
-    _class = RequirementClass(example=CWL_REQUIREMENT_INIT_WORKDIR,
-                              validator=OneOf([CWL_REQUIREMENT_INIT_WORKDIR]))
-
-
-class BuiltinRequirementSpecification(PermissiveMappingSchema):
-    title = CWL_REQUIREMENT_APP_BUILTIN
-    description = (
-        "Hint indicating that the Application Package corresponds to a builtin process of "
-        "this instance. (note: can only be an 'hint' as it is unofficial CWL specification)."
-    )
-    process = AnyIdentifier(description="Builtin process identifier.")
-
-
-class BuiltinRequirementMap(ExtendedMappingSchema):
-    req = BuiltinRequirementSpecification(name=CWL_REQUIREMENT_APP_BUILTIN)
-
-
-class BuiltinRequirementClass(BuiltinRequirementSpecification):
-    _class = RequirementClass(example=CWL_REQUIREMENT_APP_BUILTIN, validator=OneOf([CWL_REQUIREMENT_APP_BUILTIN]))
-
-
-class ESGF_CWT_RequirementSpecification(PermissiveMappingSchema):
-    title = CWL_REQUIREMENT_APP_ESGF_CWT
-    description = (
-        "Hint indicating that the Application Package corresponds to an ESGF-CWT provider process"
-        "that should be remotely executed and monitored by this instance. "
-        "(note: can only be an 'hint' as it is unofficial CWL specification)."
-    )
-    process = AnyIdentifier(description="Process identifier of the remote ESGF-CWT provider.")
-    provider = AnyIdentifier(description="ESGF-CWT provider endpoint.")
-
-
-class ESGF_CWT_RequirementMap(ExtendedMappingSchema):
-    req = ESGF_CWT_RequirementSpecification(name=CWL_REQUIREMENT_APP_ESGF_CWT)
-
-
-class ESGF_CWT_RequirementClass(ESGF_CWT_RequirementSpecification):
-    _class = RequirementClass(example=CWL_REQUIREMENT_APP_ESGF_CWT, validator=OneOf([CWL_REQUIREMENT_APP_ESGF_CWT]))
-
-
-class WPS1RequirementSpecification(PermissiveMappingSchema):
-    title = CWL_REQUIREMENT_APP_WPS1
-    description = (
-        "Hint indicating that the Application Package corresponds to a WPS-1 provider process"
-        "that should be remotely executed and monitored by this instance. "
-        "(note: can only be an 'hint' as it is unofficial CWL specification)."
-    )
-    process = AnyIdentifier(description="Process identifier of the remote WPS provider.")
-    provider = AnyIdentifier(description="WPS provider endpoint.")
-
-
-class WPS1RequirementMap(ExtendedMappingSchema):
-    req = WPS1RequirementSpecification(name=CWL_REQUIREMENT_APP_WPS1)
-
-
-class WPS1RequirementClass(WPS1RequirementSpecification):
-    _class = RequirementClass(example=CWL_REQUIREMENT_APP_WPS1, validator=OneOf([CWL_REQUIREMENT_APP_WPS1]))
-
-
-class UnknownRequirementClass(PermissiveMappingSchema):
-    _class = RequirementClass(example="UnknownRequirement")
-
-
-class CWLRequirementsMap(AnyOfKeywordSchema):
-    _any_of = [
-        DockerRequirementMap(missing=drop),
-        DockerGpuRequirementMap(missing=drop),
-        InitialWorkDirRequirementMap(missing=drop),
-        PermissiveMappingSchema(missing=drop),
-    ]
-
-
-class CWLRequirementsItem(OneOfKeywordSchema):
-    _one_of = [
-        DockerRequirementClass(missing=drop),
-        DockerGpuRequirementClass(missing=drop),
-        InitialWorkDirRequirementClass(missing=drop),
-        UnknownRequirementClass(missing=drop),  # allows anything, must be last
-    ]
-
-
-class CWLRequirementsList(ExtendedSequenceSchema):
-    requirement = CWLRequirementsItem()
-
-
-class CWLRequirements(OneOfKeywordSchema):
-    _one_of = [
-        CWLRequirementsMap(),
-        CWLRequirementsList(),
-    ]
-
-
-class CWLHintsMap(AnyOfKeywordSchema, PermissiveMappingSchema):
-    _any_of = [
-        BuiltinRequirementMap(missing=drop),
-        DockerRequirementMap(missing=drop),
-        DockerGpuRequirementMap(missing=drop),
-        InitialWorkDirRequirementMap(missing=drop),
-        ESGF_CWT_RequirementMap(missing=drop),
-        WPS1RequirementMap(missing=drop),
-    ]
-
-
-class CWLHintsItem(OneOfKeywordSchema, PermissiveMappingSchema):
-    # validators of individual requirements define which one applies
-    # in case of ambiguity, 'discriminator' distinguish between them using their 'example' values in 'class' field
-    discriminator = "class"
-    _one_of = [
-        BuiltinRequirementClass(missing=drop),
-        DockerRequirementClass(missing=drop),
-        DockerGpuRequirementClass(missing=drop),
-        InitialWorkDirRequirementClass(missing=drop),
-        ESGF_CWT_RequirementClass(missing=drop),
-        WPS1RequirementClass(missing=drop),
-        UnknownRequirementClass(missing=drop),  # allows anything, must be last
-    ]
-
-
-class CWLHintsList(ExtendedSequenceSchema):
-    hint = CWLHintsItem()
-
-
-class CWLHints(OneOfKeywordSchema):
-    _one_of = [
-        CWLHintsMap(),
-        CWLHintsList(),
-    ]
-
-
-class CWLArguments(ExtendedSequenceSchema):
-    argument = ExtendedSchemaNode(String())
-
-
-class CWLTypeString(ExtendedSchemaNode):
-    schema_type = String
-    # in this case it is ok to use 'name' because target fields receiving it will
-    # cause issues against builtin 'type' of Python reserved keyword
-    title = "Type"
-    description = "Field type definition."
-    example = "float"
-    validator = OneOf(PACKAGE_TYPE_POSSIBLE_VALUES)
-
-
-class CWLTypeSymbolValues(OneOfKeywordSchema):
-    _one_of = [
-        ExtendedSchemaNode(Float()),
-        ExtendedSchemaNode(Integer()),
-        ExtendedSchemaNode(String()),
-    ]
-
-
-class CWLTypeSymbols(ExtendedSequenceSchema):
-    symbol = CWLTypeSymbolValues()
-
-
-class CWLTypeArray(ExtendedMappingSchema):
-    type = ExtendedSchemaNode(String(), example=PACKAGE_ARRAY_BASE, validator=OneOf([PACKAGE_ARRAY_BASE]))
-    items = CWLTypeString(title="CWLTypeArrayItems", validator=OneOf(PACKAGE_ARRAY_ITEMS))
-
-
-class CWLTypeEnum(ExtendedMappingSchema):
-    type = ExtendedSchemaNode(String(), example=PACKAGE_ENUM_BASE, validator=OneOf(PACKAGE_CUSTOM_TYPES))
-    symbols = CWLTypeSymbols(summary="Allowed values composing the enum.")
-
-
-class CWLTypeBase(OneOfKeywordSchema):
-    _one_of = [
-        CWLTypeString(summary="CWL type as literal value."),
-        CWLTypeArray(summary="CWL type as list of items."),
-        CWLTypeEnum(summary="CWL type as enum of values."),
-    ]
-
-
-class CWLTypeList(ExtendedSequenceSchema):
-    type = CWLTypeBase()
-
-
-class CWLType(OneOfKeywordSchema):
-    title = "CWL Type"
-    _one_of = [
-        CWLTypeBase(summary="CWL type definition."),
-        CWLTypeList(summary="Combination of allowed CWL types."),
-    ]
-
-
-class AnyLiteralList(ExtendedSequenceSchema):
-    default = AnyLiteralType()
-
-
-class CWLDefault(OneOfKeywordSchema):
-    _one_of = [
-        AnyLiteralType(),
-        AnyLiteralList(),
-    ]
-
-
-class CWLInputObject(PermissiveMappingSchema):
-    type = CWLType()
-    default = CWLDefault(missing=drop, description="Default value of input if not provided for task execution.")
-    inputBinding = ExtendedMappingSchema(missing=drop, title="Input Binding",
-                                         description="Defines how to specify the input for the command.")
-
-
-class CWLTypeStringList(ExtendedSequenceSchema):
-    description = "List of allowed direct CWL type specifications as strings."
-    type = CWLType()
-
-
-class CWLInputType(OneOfKeywordSchema):
-    description = "CWL type definition of the input."
-    _one_of = [
-        CWLTypeString(summary="Direct CWL type string specification."),
-        CWLTypeStringList(summary="List of allowed CWL type strings."),
-        CWLInputObject(summary="CWL type definition with parameters."),
-    ]
-
-
-class CWLInputMap(PermissiveMappingSchema):
-    input_id = CWLInputType(variable="<input-id>", title="CWLInputIdentifierType",
-                            description=IO_INFO_IDS.format(first="CWL", second="WPS", what="input") +
-                            " (Note: '<input-id>' is a variable corresponding for each identifier)")
-
-
-class InputItem(CWLInputObject):
-    id = AnyIdentifier(description="Some ID")
-
-
-class CWLInputList(ExtendedSequenceSchema):
-    input = InputItem(title="Input", description="Input specification.")
-
-
-class InputsDefinition(OneOfKeywordSchema):
-    _one_of = [
-        CWLInputList(description="Package inputs defined as items."),
-        CWLInputMap(description="Package inputs defined as mapping."),
-    ]
-
-
-class OutputBinding(PermissiveMappingSchema):
-    glob = ExtendedSchemaNode(String(), missing=drop,
-                              description="Glob pattern the will find the output on disk or mounted docker volume.")
-
-
-class CWLOutputObject(PermissiveMappingSchema):
-    type = CWLType()
-    # 'outputBinding' should usually be there most of the time (if not always) to retrieve file,
-    # but can technically be omitted in some very specific use-cases such as output literal or output is std logs
-    outputBinding = OutputBinding(
-        missing=drop,
-        description="Defines how to retrieve the output result from the command."
-    )
-
-
-class CWLOutputType(OneOfKeywordSchema):
-    _one_of = [
-        CWLTypeString(summary="Direct CWL type string specification."),
-        CWLTypeStringList(summary="List of allowed CWL type strings."),
-        CWLOutputObject(summary="CWL type definition with parameters."),
-    ]
-
-
-class CWLOutputMap(ExtendedMappingSchema):
-    output_id = CWLOutputType(variable="<output-id>", title="CWLOutputIdentifierType",
-                              description=IO_INFO_IDS.format(first="CWL", second="WPS", what="output") +
-                              " (Note: '<output-id>' is a variable corresponding for each identifier)")
-
-
-class CWLOutputItem(CWLOutputObject):
-    id = AnyIdentifier(description=IO_INFO_IDS.format(first="CWL", second="WPS", what="output"))
-
-
-class CWLOutputList(ExtendedSequenceSchema):
-    input = CWLOutputItem(description="Output specification. " + CWL_DOC_MESSAGE)
-
-
-class CWLOutputsDefinition(OneOfKeywordSchema):
-    _one_of = [
-        CWLOutputList(description="Package outputs defined as items."),
-        CWLOutputMap(description="Package outputs defined as mapping."),
-    ]
-
-
-class CWLCommandParts(ExtendedSequenceSchema):
-    cmd = ExtendedSchemaNode(String())
-
-
-class CWLCommand(OneOfKeywordSchema):
-    _one_of = [
-        ExtendedSchemaNode(String(), title="String command."),
-        CWLCommandParts(title="Command Parts")
-    ]
-
-
-class CWLVersion(Version):
-    description = "CWL version of the described application package."
-    example = CWL_VERSION
-    validator = SemanticVersion(v_prefix=True, rc_suffix=False)
-
-
-class CWL(PermissiveMappingSchema):
-    cwlVersion = CWLVersion()
-    _class = CWLClass()
-    requirements = CWLRequirements(description="Explicit requirement to execute the application package.", missing=drop)
-    hints = CWLHints(description="Non-failing additional hints that can help resolve extra requirements.", missing=drop)
-    baseCommand = CWLCommand(description="Command called in the docker image or on shell according to requirements "
-                                         "and hints specifications. Can be omitted if already defined in the "
-                                         "docker image.", missing=drop)
-    arguments = CWLArguments(description="Base arguments passed to the command.", missing=drop)
-    inputs = InputsDefinition(description="All inputs available to the Application Package.")
-    outputs = CWLOutputsDefinition(description="All outputs produced by the Application Package.")
-
-
-class Unit(ExtendedMappingSchema):
-    unit = CWL(description="Execution unit definition as CWL package specification. " + CWL_DOC_MESSAGE)
 
 
 class ProcessInputDefaultValues(ExtendedSequenceSchema):
@@ -2324,8 +1806,6 @@ class JobOutputList(ExtendedSequenceSchema):
     output = JobOutput(description="Job output result with specific keyword according to represented format.")
 
 
-# implement only literal part of:
-#   https://raw.githubusercontent.com/opengeospatial/ogcapi-processes/master/core/openapi/schemas/inlineOrRefData.yaml
 class ResultLiteral(AnyLiteralValueType, LiteralDataDomainDefinition):
     # value = <AnyLiteralValueType>
     pass
@@ -2358,7 +1838,6 @@ class ResultReferenceList(ExtendedSequenceSchema):
 
 
 class ResultData(OneOfKeywordSchema):
-    schema_ref = "{}/master/core/openapi/schemas/result.yaml".format(OGC_API_SCHEMA_URL)
     _one_of = [
         # must place formatted value first since both value/format fields are simultaneously required
         # other classes require only one of the two, and therefore are more permissive during schema validation
@@ -2373,7 +1852,6 @@ class ResultData(OneOfKeywordSchema):
 
 class Result(ExtendedMappingSchema):
     """Result outputs obtained from a successful process job execution."""
-    example_ref = "{}/master/core/examples/json/Result.json".format(OGC_API_SCHEMA_URL)
     output_id = ResultData(
         variable="<output-id>", title="Output Identifier",
         description=(
@@ -2394,7 +1872,7 @@ class JobOutputsSchema(ExtendedMappingSchema):
 
 
 class JobException(ExtendedMappingSchema):
-    # note: test fields correspond exactly to 'owslib.wps.WPSException', they are deserialized as is
+    # note: test fields correspond exactly to 'Applib.App.AppException', they are deserialized as is
     Code = ExtendedSchemaNode(String())
     Locator = ExtendedSchemaNode(String(), default=None)
     Text = ExtendedSchemaNode(String())
@@ -2411,8 +1889,8 @@ class JobLogsSchema(ExtendedSequenceSchema):
 class FrontpageParameterSchema(ExtendedMappingSchema):
     name = ExtendedSchemaNode(String(), example="api")
     enabled = ExtendedSchemaNode(Boolean(), example=True)
-    url = URL(description="Referenced parameter endpoint.", example="https://weaver-host", missing=drop)
-    doc = ExtendedSchemaNode(String(), example="https://weaver-host/api", missing=drop)
+    url = URL(description="Referenced parameter endpoint.", example="https://demo-api", missing=drop)
+    doc = ExtendedSchemaNode(String(), example="https://demo-api/api", missing=drop)
 
 
 class FrontpageParameters(ExtendedSequenceSchema):
@@ -2420,8 +1898,8 @@ class FrontpageParameters(ExtendedSequenceSchema):
 
 
 class FrontpageSchema(ExtendedMappingSchema):
-    message = ExtendedSchemaNode(String(), default="Weaver Information", example="Weaver Information")
-    configuration = ExtendedSchemaNode(String(), default="default", example="default")
+    message = ExtendedSchemaNode(String(), default="Demo API Information", example="API Information")
+    description = ExtendedSchemaNode(String(), default="default", example="default")
     parameters = FrontpageParameters()
 
 
@@ -2449,42 +1927,11 @@ class VersionsSchema(ExtendedMappingSchema):
 
 class ConformanceList(ExtendedSequenceSchema):
     conformance = URL(description="Conformance specification link.",
-                      example="http://www.opengis.net/spec/WPS/2.0/req/service/binding/rest-json/core")
+                      example="http://www.opengis.net/spec/App/2.0/req/service/binding/rest-json/core")
 
 
 class ConformanceSchema(ExtendedMappingSchema):
     conformsTo = ConformanceList()
-
-
-#################################################################
-# Local Processes schemas
-#################################################################
-
-
-class PackageBody(ExtendedMappingSchema):
-    pass
-
-
-class ExecutionUnit(OneOfKeywordSchema):
-    _one_of = [
-        Reference(name="Reference", title="Reference", description="Execution Unit reference."),
-        Unit(name="Unit", title="Unit", description="Execution Unit definition."),
-    ]
-
-
-class ExecutionUnitList(ExtendedSequenceSchema):
-    unit = ExecutionUnit(
-        name="ExecutionUnit",
-        title="ExecutionUnit",
-        description="Definition of the Application Package to execute."
-    )
-
-
-class Process(ExtendedMappingSchema):
-    name = ExtendedSchemaNode(String())
-    id = AnyIdentifier()
-    version = Version(missing=null)
-    created = ExtendedSchemaNode(DateTime(), description="Creation date and time of the quote in ISO-8601 format.")
 
 
 class Deploy(ExtendedMappingSchema):
@@ -2507,7 +1954,7 @@ class GetJobsQueries(ExtendedMappingSchema):
     page = ExtendedSchemaNode(Integer(), missing=drop, default=0, validator=Range(min=0))
     limit = ExtendedSchemaNode(Integer(), missing=drop, default=10)
     status = JobStatusEnum(missing=drop)
-    process = AnyIdentifier(missing=None)
+    process = ProcessIdentifier(missing=None)
     provider = ExtendedSchemaNode(String(), missing=drop, default=None)
     sort = JobSortEnum(missing=drop)
     tags = ExtendedSchemaNode(String(), missing=drop, default=None,
@@ -2527,10 +1974,6 @@ class GetProcessJobsEndpoint(GetJobsRequest, ProcessPath):
     pass
 
 
-class GetProviderJobsEndpoint(GetJobsRequest, ProviderPath, ProcessPath):
-    pass
-
-
 class GetProcessJobEndpoint(ProcessPath):
     header = RequestHeaders()
 
@@ -2539,101 +1982,25 @@ class DeleteProcessJobEndpoint(ProcessPath):
     header = RequestHeaders()
 
 
-class BillsEndpoint(ExtendedMappingSchema):
-    header = RequestHeaders()
-
-
-class BillEndpoint(BillPath):
-    header = RequestHeaders()
-
-
-class ProcessQuotesEndpoint(ProcessPath):
-    header = RequestHeaders()
-
-
-class ProcessQuoteEndpoint(ProcessPath, QuotePath):
-    header = RequestHeaders()
-
-
-class GetQuotesQueries(ExtendedMappingSchema):
-    page = ExtendedSchemaNode(Integer(), missing=drop, default=0)
-    limit = ExtendedSchemaNode(Integer(), missing=drop, default=10)
-    process = AnyIdentifier(missing=None)
-    sort = QuoteSortEnum(missing=drop)
-
-
-class QuotesEndpoint(ExtendedMappingSchema):
-    header = RequestHeaders()
-    querystring = GetQuotesQueries()
-
-
-class QuoteEndpoint(QuotePath):
-    header = RequestHeaders()
-
-
-class PostProcessQuote(ProcessPath, QuotePath):
-    header = RequestHeaders()
-    body = NoContent()
-
-
-class PostQuote(QuotePath):
-    header = RequestHeaders()
-    body = NoContent()
-
-
-class PostProcessQuoteRequestEndpoint(ProcessPath, QuotePath):
-    header = RequestHeaders()
-    body = QuoteProcessParametersSchema()
-
-
-# ################################################################
-# Provider Processes schemas
-# ################################################################
-
-
-class GetProviders(ExtendedMappingSchema):
-    header = RequestHeaders()
-
-
-class PostProvider(ExtendedMappingSchema):
-    header = RequestHeaders()
-    body = CreateProviderRequestBody()
-
-
-class GetProviderProcesses(ExtendedMappingSchema):
-    header = RequestHeaders()
-
-
-class GetProviderProcess(ExtendedMappingSchema):
-    header = RequestHeaders()
-
-
-class PostProviderProcessJobRequest(ExtendedMappingSchema):
-    """Launching a new process request definition."""
-    header = RequestHeaders()
-    querystring = LaunchJobQuerystring()
-    body = Execute()
-
-
-# ################################################################
+##################################################################################################################
 # Responses schemas
-# ################################################################
+##################################################################################################################
 
 class ErrorDetail(ExtendedMappingSchema):
     code = ExtendedSchemaNode(Integer(), description="HTTP status code.", example=400)
     status = ExtendedSchemaNode(String(), description="HTTP status detail.", example="400 Bad Request")
 
 
-class OWSErrorCode(ExtendedSchemaNode):
+class AppErrorCode(ExtendedSchemaNode):
     schema_type = String
     example = "InvalidParameterValue"
-    description = "OWS error code."
+    description = "App error code."
 
 
-class OWSExceptionResponse(ExtendedMappingSchema):
+class AppExceptionResponse(ExtendedMappingSchema):
     """Error content in XML format"""
-    description = "OWS formatted exception."
-    code = OWSErrorCode(example="NoSuchProcess")
+    description = "App formatted exception."
+    code = AppErrorCode(example="NoSuchProcess")
     locator = ExtendedSchemaNode(String(), example="identifier",
                                  description="Indication of the element that caused the error.")
     message = ExtendedSchemaNode(String(), example="Invalid process ID.",
@@ -2641,20 +2008,14 @@ class OWSExceptionResponse(ExtendedMappingSchema):
 
 
 class ErrorJsonResponseBodySchema(ExtendedMappingSchema):
-    code = OWSErrorCode()
+    code = AppErrorCode()
     description = ExtendedSchemaNode(String(), description="Detail about the cause of error.")
     error = ErrorDetail(missing=drop)
-    exception = OWSExceptionResponse(missing=drop)
+    exception = AppExceptionResponse(missing=drop)
 
 
 class ForbiddenProcessAccessResponseSchema(ExtendedMappingSchema):
     description = "Referenced process is not accessible."
-    header = ResponseHeaders()
-    body = ErrorJsonResponseBodySchema()
-
-
-class ForbiddenProviderAccessResponseSchema(ExtendedMappingSchema):
-    description = "Referenced provider is not accessible."
     header = ResponseHeaders()
     body = ErrorJsonResponseBodySchema()
 
@@ -2720,10 +2081,6 @@ class OkGetProviderProcessesSchema(ExtendedMappingSchema):
 
 
 class GetProcessesQuery(ExtendedMappingSchema):
-    providers = ExtendedSchemaNode(
-        Boolean(), example=True, default=False, missing=drop,
-        description="List local processes as well as all sub-processes of all registered providers. "
-                    "Applicable only for Weaver in {} mode, false otherwise.".format(WEAVER_CONFIGURATION_EMS))
     detail = ExtendedSchemaNode(
         Boolean(), example=True, default=True, missing=drop,
         description="Return summary details about each process, or simply their IDs."
@@ -2739,7 +2096,7 @@ class OkGetProcessesListResponse(ExtendedMappingSchema):
     body = ProcessCollection()
 
 
-class OkPostProcessDeployBodySchema(ExtendedMappingSchema):
+class ProcessDeployBodySchema(ExtendedMappingSchema):
     deploymentDone = ExtendedSchemaNode(Boolean(), default=False, example=True,
                                         description="Indicates if the process was successfully deployed.")
     processSummary = ProcessSummary(missing=drop, description="Deployed process summary if successful.")
@@ -2747,9 +2104,22 @@ class OkPostProcessDeployBodySchema(ExtendedMappingSchema):
                                        description="Description of deploy failure if applicable.")
 
 
-class OkPostProcessesResponse(ExtendedMappingSchema):
+class CreatedProcessesResponse(ExtendedMappingSchema):
     header = ResponseHeaders()
-    body = OkPostProcessDeployBodySchema()
+    body = ProcessDeployBodySchema()
+
+
+class OkDeleteProcessUndeployBodySchema(ExtendedMappingSchema):
+    deploymentDone = ExtendedSchemaNode(Boolean(), default=False, example=True,
+                                        description="Indicates if the process was successfully undeployed.")
+    identifier = ExtendedSchemaNode(String(), example="workflow")
+    failureReason = ExtendedSchemaNode(String(), missing=drop,
+                                       description="Description of undeploy failure if applicable.")
+
+
+class OkDeleteProcessResponse(ExtendedMappingSchema):
+    header = ResponseHeaders()
+    body = OkDeleteProcessUndeployBodySchema()
 
 
 class BadRequestGetProcessInfoResponse(ExtendedMappingSchema):
@@ -2757,9 +2127,34 @@ class BadRequestGetProcessInfoResponse(ExtendedMappingSchema):
     body = NoContent()
 
 
-class OkGetProcessInfoResponse(ExtendedMappingSchema):
+class OkGetProcessResponse(ExtendedMappingSchema):
     header = ResponseHeaders()
-    body = ProcessOffering()
+    body = Process()
+
+
+class CreatedAcceptJobResponse(ExtendedMappingSchema):
+    header = ResponseHeaders()
+    body = CreatedJobStatusSchema()
+
+
+class OkGetProcessJobResponse(ExtendedMappingSchema):
+    header = ResponseHeaders()
+    body = JobStatusInfo()
+
+
+class OkDeleteProcessJobResponse(ExtendedMappingSchema):
+    header = ResponseHeaders()
+    body = DismissedJobSchema()
+
+
+class OkGetQueriedJobsResponse(ExtendedMappingSchema):
+    header = ResponseHeaders()
+    body = GetQueriedJobsSchema()
+
+
+class OkDismissJobResponse(ExtendedMappingSchema):
+    header = ResponseHeaders()
+    body = DismissedJobSchema()
 
 
 class OkGetJobStatusResponse(ExtendedMappingSchema):
@@ -2802,37 +2197,6 @@ class OkGetJobResultsResponse(ExtendedMappingSchema):
     header = ResponseHeaders()
     body = Result()
 
-
-class CreatedQuoteExecuteResponse(ExtendedMappingSchema):
-    header = ResponseHeaders()
-    body = CreatedQuotedJobStatusSchema()
-
-
-class CreatedQuoteRequestResponse(ExtendedMappingSchema):
-    header = ResponseHeaders()
-    body = QuoteSchema()
-
-
-class OkGetQuoteInfoResponse(ExtendedMappingSchema):
-    header = ResponseHeaders()
-    body = QuoteSchema()
-
-
-class OkGetQuoteListResponse(ExtendedMappingSchema):
-    header = ResponseHeaders()
-    body = QuotationListSchema()
-
-
-class OkGetBillDetailResponse(ExtendedMappingSchema):
-    header = ResponseHeaders()
-    body = BillSchema()
-
-
-class OkGetBillListResponse(ExtendedMappingSchema):
-    header = ResponseHeaders()
-    body = BillListSchema()
-
-
 class OkGetJobExceptionsResponse(ExtendedMappingSchema):
     header = ResponseHeaders()
     body = JobExceptionsSchema()
@@ -2870,54 +2234,32 @@ get_api_conformance_responses = {
 get_processes_responses = {
     "200": OkGetProcessesListResponse(description="success", examples={
         "ProcessesList": {
-            "summary": "Listing of local processes registered in Weaver.",
-            "value": EXAMPLES["local_process_listing.json"],
+            "summary": "Listing of registered processes.",
+            "value": EXAMPLES["process_listing.json"]["data"],
         }
     }),
     "500": InternalServerErrorResponseSchema(),
 }
 post_processes_responses = {
-    "201": OkPostProcessesResponse(description="success"),
+    "201": CreatedProcessesResponse(description="success"),
     "500": InternalServerErrorResponseSchema(),
 }
 get_process_responses = {
-    "200": OkGetProcessInfoResponse(description="success", examples={
-        "ProcessDescription": {
-            "summary": "Description of a local process registered in Weaver.",
-            "value": EXAMPLES["local_process_description.json"],
+    "200": OkGetProcessResponse(
+        description="success",
+        # detailed response examples from external file content!
+        examples={
+            "ProcessDescription": {
+                "summary": "Description of a process.",
+                # file path must be found relative to where the API schema gets generated and published
+                # otherwise, provide an absolute path to make sure it gets found
+                # here we use examples that where pre-loaded earlier for convenience
+                # NOTE: 'path' is used, so 'externalValue' is defined instead of directly providing 'value'
+                "externalValue": EXAMPLES["process_description.json"]["path"],
+            }
         }
-    }),
+    ),
     "400": BadRequestGetProcessInfoResponse(),
-    "500": InternalServerErrorResponseSchema(),
-}
-get_process_package_responses = {
-    "200": OkGetProcessPackageSchema(description="success", examples={
-        "PackageCWL": {
-            "summary": "CWL Application Package definition of the local process.",
-            "value": EXAMPLES["local_process_package.json"],
-        }
-    }),
-    "403": ForbiddenProcessAccessResponseSchema(),
-    "500": InternalServerErrorResponseSchema(),
-}
-get_process_payload_responses = {
-    "200": OkGetProcessPayloadSchema(description="success", examples={
-        "Payload": {
-            "summary": "Payload employed during process deployment and registration.",
-            "value": EXAMPLES["local_process_payload.json"],
-        }
-    }),
-    "403": ForbiddenProcessAccessResponseSchema(),
-    "500": InternalServerErrorResponseSchema(),
-}
-get_process_visibility_responses = {
-    "200": OkGetProcessVisibilitySchema(description="success"),
-    "403": ForbiddenProcessAccessResponseSchema(),
-    "500": InternalServerErrorResponseSchema(),
-}
-put_process_visibility_responses = {
-    "200": OkPutProcessVisibilitySchema(description="success"),
-    "403": ForbiddenVisibilityUpdateResponseSchema(),
     "500": InternalServerErrorResponseSchema(),
 }
 delete_process_responses = {
@@ -2925,72 +2267,38 @@ delete_process_responses = {
     "403": ForbiddenProcessAccessResponseSchema(),
     "500": InternalServerErrorResponseSchema(),
 }
-get_providers_list_responses = {
-    "200": OkGetProvidersListResponse(description="success", examples={
-        "ProviderList": {
-            "summary": "Listing of registered remote providers.",
-            "value": EXAMPLES["provider_listing.json"],
-        }
-    }),
-    "403": ForbiddenProviderAccessResponseSchema(),
-    "500": InternalServerErrorResponseSchema(),
-}
-get_provider_responses = {
-    "200": OkGetProviderCapabilitiesSchema(description="success", examples={
-        "ProviderDescription": {
-            "summary": "Description of a registered remote WPS provider.",
-            "value": EXAMPLES["provider_description.json"],
-        }
-    }),
-    "403": ForbiddenProviderAccessResponseSchema(),
-    "500": InternalServerErrorResponseSchema(),
-}
-delete_provider_responses = {
-    "204": NoContentDeleteProviderSchema(description="success"),
-    "403": ForbiddenProviderAccessResponseSchema(),
-    "500": InternalServerErrorResponseSchema(),
-    "501": NotImplementedDeleteProviderResponse(),
-}
-get_provider_processes_responses = {
-    "200": OkGetProviderProcessesSchema(description="success"),
-    "403": ForbiddenProviderAccessResponseSchema(),
-    "500": InternalServerErrorResponseSchema(),
-}
-get_provider_process_responses = {
-    "200": OkGetProviderProcessDescriptionResponse(description="success", examples={
-        "ProviderProcessWPS": {
-            "summary": "Description of a remote WPS provider process converted to OGC-API Processes format.",
-            "value": EXAMPLES["provider_process_description.json"]
-        }
-    }),
-    "403": ForbiddenProviderAccessResponseSchema(),
-    "500": InternalServerErrorResponseSchema(),
-}
 get_jobs_responses = {
-    "200": OkGetQueriedJobsResponse(description="success", examples={
-        "JobListing": {
-            "summary": "Job ID listing with default queries.",
-            # detailed examples!
-            "value": {
-                "jobs": [
-                    "a9d14bf4-84e0-449a-bac8-16e598efe807",
-                    "84e0a9f5-498a-2345-1244-afe54a234cb1"
-                ]
+    "200": OkGetQueriedJobsResponse(
+        description="success",
+        # detailed response examples from literal content!
+        examples={
+            "JobListing": {
+                "summary": "Job ID listing with default queries.",
+                "value": {
+                    "jobs": [
+                        "a9d14bf4-84e0-449a-bac8-16e598efe807",
+                        "84e0a9f5-498a-2345-1244-afe54a234cb1"
+                    ]
+                }
             }
         }
-    }),
+    ),
     "500": InternalServerErrorResponseSchema(),
 }
-get_single_job_status_responses = {
-    "200": OkGetJobStatusResponse(description="success", examples={
-        "JobStatusSuccess": {
-            "summary": "Successful job status response.",
-            "value": EXAMPLES["job_status_success.json"]},
-        "JobStatusFailure": {
-            "summary": "Failed job status response.",
-            "value": EXAMPLES["job_status_failed.json"],
+get_job_responses = {
+    "200": OkGetJobStatusResponse(
+        description="success",
+        examples={
+            # any number of examples is supported for responses!
+            "JobStatusSuccess": {
+                "summary": "Successful job status response.",
+                "value": EXAMPLES["job_status_success.json"]},
+            "JobStatusFailure": {
+                "summary": "Failed job status response.",
+                "value": EXAMPLES["job_status_failed.json"],
+            }
         }
-    }),
+    ),
     "404": NotFoundJobResponseSchema(),
     "500": InternalServerErrorResponseSchema(),
 }
@@ -2999,85 +2307,8 @@ delete_job_responses = {
     "404": NotFoundJobResponseSchema(),
     "500": InternalServerErrorResponseSchema(),
 }
-get_job_inputs_responses = {
-    "200": OkGetJobInputsResponse(description="success", examples={
-        "JobInputs": {
-            "summary": "Submitted job input values at for process execution.",
-            "value": EXAMPLES["job_inputs.json"],
-        }
-    }),
-    "404": NotFoundJobResponseSchema(),
-    "500": InternalServerErrorResponseSchema(),
-}
-get_job_outputs_responses = {
-    "200": OkGetJobOutputsResponse(description="success", examples={
-        "JobOutputs": {
-            "summary": "Obtained job outputs values following process execution.",
-            "value": EXAMPLES["job_outputs.json"],
-        }
-    }),
-    "404": NotFoundJobResponseSchema(),
-    "500": InternalServerErrorResponseSchema(),
-}
-get_result_redirect_responses = {
-    "308": RedirectResultResponse(description="Redirects '/result' (without 's') to corresponding '/results' path."),
-}
-get_job_results_responses = {
-    "200": OkGetJobResultsResponse(description="success", examples={
-        "JobResults": {
-            "summary": "Obtained job results.",
-            "value": EXAMPLES["job_results.json"],
-        }
-    }),
-    "404": NotFoundJobResponseSchema(),
-    "500": InternalServerErrorResponseSchema(),
-}
-get_exceptions_responses = {
-    "200": OkGetJobExceptionsResponse(description="success", examples={
-        "JobExceptions": {
-            "summary": "Job exceptions that occurred during failing process execution.",
-            "value": EXAMPLES["job_exceptions.json"],
-        }
-    }),
-    "404": NotFoundJobResponseSchema(),
-    "500": InternalServerErrorResponseSchema(),
-}
-get_logs_responses = {
-    "200": OkGetJobLogsResponse(description="success", examples={
-        "JobLogs": {
-            "summary": "Job logs registered and captured throughout process execution.",
-            "value": EXAMPLES["job_logs.json"],
-        }
-    }),
-    "404": NotFoundJobResponseSchema(),
-    "500": InternalServerErrorResponseSchema(),
-}
-get_quote_list_responses = {
-    "200": OkGetQuoteListResponse(description="success"),
-    "500": InternalServerErrorResponseSchema(),
-}
-get_quote_responses = {
-    "200": OkGetQuoteInfoResponse(description="success"),
-    "500": InternalServerErrorResponseSchema(),
-}
-post_quotes_responses = {
-    "201": CreatedQuoteRequestResponse(description="success"),
-    "500": InternalServerErrorResponseSchema(),
-}
-post_quote_responses = {
-    "201": CreatedQuoteExecuteResponse(description="success"),
-    "500": InternalServerErrorResponseSchema(),
-}
-get_bill_list_responses = {
-    "200": OkGetBillListResponse(description="success"),
-    "500": InternalServerErrorResponseSchema(),
-}
-get_bill_responses = {
-    "200": OkGetBillDetailResponse(description="success"),
-    "500": InternalServerErrorResponseSchema(),
-}
-wps_responses = {
-    "200": OkWPSResponse(examples={
+xml_app_responses = {
+    "200": OkAppResponse(examples={
         "GetCapabilities": {
             "summary": "GetCapabilities example response.",
             "value": EXAMPLES["wps_getcapabilities.xml"]
@@ -3086,24 +2317,23 @@ wps_responses = {
             "summary": "DescribeProcess example response.",
             "value": EXAMPLES["wps_describeprocess.xml"]
         },
-        "Execute": {
-            "summary": "Execute example response.",
-            "value": EXAMPLES["wps_execute_response.xml"]
-        }
+        # "Execute": # no implemented for demo
     }),
-    "400": ErrorWPSResponse(examples={
+    "400": ErrorAppResponse(examples={
         "MissingParameterError": {
             "summary": "Error report in case of missing request parameter.",
             "value": EXAMPLES["wps_missing_parameter.xml"],
         }
     }),
-    "500": ErrorWPSResponse(),
+    "500": ErrorAppResponse(),
 }
 
 
 ##################################
-# Define some test data
+# Define some test data, only for demonstration purposes
+#
 # In a real application, these would probably be retrieved from a database or some file system structure.
+
 
 _PROCESSES = {
     "example": {
@@ -3121,25 +2351,40 @@ _JOBS = [
 
 ##################################
 
-
 class DemoProcessJobAPI(object):
     """
     The Web Application that will use the OpenAPI schema objects defined above.
     """
 
+    @staticmethod
     @api_frontpage_service.get(tags=[TAG_API], response_schemas=get_api_frontpage_responses)
-    def  get_api(self, request):
+    def get_api(request):
+        url = request.url[:-1] if request.url.endswith("/") else request.url
+        data = {
+            "message": "Demo API",
+            "description": "This is a demo app to demonstrate support of OpenAPI v3 schema generation.",
+            "parameters": [
+                {"name": "schema", "url": url + openapi_json_service.path, "enabled": True},
+                {"name": "swagger", "url": url + api_openapi_ui_service.path, "enabled": True},
+                {"name": "processes", "url": url + processes_service.path, "enabled": True},
+                {"name": "jobs", "url": url + jobs_service.path, "enabled": True},
+                {"name": "xml", "url": url + xml_service.path, "enabled": True},
+            ]
+        }
+        return HTTPOk(json=data)
 
+    @staticmethod
     @processes_service.get(tags=[TAG_PROCESSES], response_schemas=get_processes_responses)
-    def get_processes(self, request):
+    def get_processes(request):
         """Get the list of processes."""
-        detail = request.param("detail", False)
+        detail = request.params("detail", False)
         if detail:
             return _PROCESSES
         return [proc["name"] for proc in _PROCESSES]
 
+    @staticmethod
     @processes_service.post(tags=[TAG_PROCESSES], schema=Deploy(), response_schemas=post_processes_responses)
-    def create_processes(self, request):
+    def create_processes(request):
         """Create a new process."""
         body = {}
         if "name" not in body:
@@ -3150,50 +2395,79 @@ class DemoProcessJobAPI(object):
         _PROCESSES[body["name"]] = body
         return HTTPCreated("process deployed")
 
+    @staticmethod
     @process_service.get(tags=[TAG_PROCESSES], response_schemas=get_process_responses)
-    def get_process(self, request):
+    def get_process(request):
         """Get a single process."""
         process = request.matchdict['process_id']
         if process not in _PROCESSES:
             raise HTTPNotFound("process not found")
-        return _PROCESSES[process]
+        return HTTPOk(json=_PROCESSES[process])
 
+    @staticmethod
     @job_service.get(tags=[TAG_JOBS], response_schemas=get_job_responses)
-    def get_job(self, request):
+    def get_job(request):
         """Retrieve some job by UUID."""
         job_id = request.matchdict("job_id")
         if not job_id:
             raise HTTPBadRequest("invalid job id")
         if job_id not in _JOBS:
-            raise HTTPNotFound(json={
-                "id": "11111111-2222-3333-4444-555555555555",
-                "msg": "job does not exist"
-            })
-        return _JOBS[job_id]
+            raise HTTPNotFound(json=EXAMPLES["job_not_found.json"]["data"])  # reuse for convenience
+        return HTTPOk(json=_JOBS[job_id])
 
+    @staticmethod
+    @xml_service.get(tags=[TAG_PROCESSES], response_schemas=xml_app_responses)
+    def app_xml_endpoint(request):
+        """XML endpoint of the application."""
 
-def setup():
+        # here we will use the predefined XML examples for convenience
+        # a real application would have to implement adequate processing and functionality
+        req = str(request.params.get("request", "")).lower()
+        err = EXAMPLES["wps_missing_parameter.xml"]["data"]
+        if req == "execute":
+            return HTTPNotImplemented(detail="Not implemented for this demo.")
+        if req not in ["getcapabilities", "describeprocess"]:
+            return HTTPBadRequest(detail="Missing parameter", body=err)
+        if req == "getcapabilities":
+            return HTTPOk(body=EXAMPLES["wps_getcapabilities.xml"])
+        proc = str(request.params.get("process", ""))
+        if proc != "demo":
+            err = err.replace("Missing", "Invalid").replace("request", "process")
+            return HTTPBadRequest(detail="Invalid parameter", body=err)
+        return HTTPOk(body=EXAMPLES["app_describeprocess.xml"])
+        
+
+def make_app():
     config = Configurator()
-    config.include('cornice')
-    config.include('cornice_swagger')
+    config.include("cornice")
+    config.include("cornice_swagger")
     # Create views to serve our OpenAPI spec
     config.cornice_enable_openapi_view(
-        api_path="/json",
-        title='DemoProcessJobAPI',
+        api_path=openapi_json_service.path,
+        title="DemoProcessJobAPI",
         description="OpenAPI documentation",
         version="1.0.0"
     )
     # Create views to serve OpenAPI spec UI explorer
-    config.cornice_enable_openapi_explorer(api_explorer_path='/api-explorer')
+    config.cornice_enable_openapi_explorer(api_explorer_path=api_openapi_ui_service.path)
     config.scan()
     app = config.make_wsgi_app()
     return app
 
 
-if __name__ == '__main__':
-    app = setup()
-    server = make_server('127.0.0.1', 8001, app)
-    print('Visit me on http://127.0.0.1:8001')
-    print('''You can see the API explorer here:
-    http://127.0.0.1:8001/api-explorer''')
+def main():
+    parser = argparse.ArgumentParser(description="Demo OpenAPI v3 application.", add_help=True)
+    parser.add_argument("--host", "-H", help="Host where to run the app", default="localhost")
+    parser.add_argument("--port", "-P", help="Port where to access the app", default=8001, type=int)
+    args = parser.parse_args()
+    app = make_app()
+    url = "http://{}:{}".format(args.host, args.port)
+    server = make_server(args.host, args.port, app)
+    print("Visit me on {}".format(url))
+    print("API explorer here: {}{}".format(url, api_openapi_ui_service.path))
+    print("And the generated API schema here: {}{}".format(url, openapi_json_service.path))
     server.serve_forever()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,7 @@
+<app:ExceptionReport
+        xsi:schemaLocation="https://www.demo-app.com/schemas https://www.demo-app.com/schemas/owsExceptionReport.xsd"
+        version="1.0.0">
+    <app:Exception exceptionCode="MissingParameterValue" locator="request">
+        <app:ExceptionText>Missing parameter value</app:ExceptionText>
+    </app:Exception>
+</app:ExceptionReport>

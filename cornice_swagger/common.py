@@ -2,6 +2,7 @@
 These are many common schema definitions that are very recurrent in Web Applications.
 They can be employed as is, or extended, at your own convenience.
 """
+import enum
 import re
 import colander
 
@@ -59,6 +60,20 @@ class FileURL(ExtendedSchemaNode):
     description = "URL file reference."
     format = "url"
     validator = SchemeURL(schemes=["http", "https"])
+
+
+class OneOfEnum(colander.OneOf):
+    def __init__(self, choices, attr="value"):
+        if isinstance(choices, enum.EnumMeta):
+            if attr == "name":
+                choices = list(choices.__members__)
+            elif attr == "value":
+                choices = list(c.value for c in choices.__members__.values())
+            else:
+                raise SchemaNodeTypeError(
+                    "Unknown attr value {!s} for OneOfEnum, must be one of [name, value]".format(attr)
+                )
+        super(OneOfEnum, self).__init__(choices)
 
 
 class OneOfCaseInsensitive(colander.OneOf):
