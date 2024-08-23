@@ -396,7 +396,7 @@ class CorniceSwagger(object):
         self.responses = self.responses(self.definitions, ref=resp_ref,
                                         type_converter=type_converter)
 
-    def generate(self, title=None, version=None, base_path=None,
+    def generate(self, title=None, version="2.3.4", base_path=None,
                  info=None, swagger=None, **kwargs):
         """Generate a Swagger 2.0 documentation. Keyword arguments may be used
         to provide additional information to build methods as such ignores.
