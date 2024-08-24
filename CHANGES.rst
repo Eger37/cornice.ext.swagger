@@ -10,6 +10,17 @@ Since version 1.1.0, we use `Github releases <https://github.com/Cornices/cornic
 1.0.1 (2021-08-30)
 ------------------
 
+- Support of ``deprecated`` path/method keyword from view/schema.
+- Support OpenAPI 3.0.0 specification generation.
+- Support ``oneOf, allOf, anyOf, not`` keywords for objects and arrays.
+  Requires ``openapi_spec=3`` when calling ``CorniceSwagger().generate()`` ::
+
+    def OneOfSchema(colander.MappingSchema):
+        name = colander.SchemaNode(colander.String())
+        id = colander.SchemaNode(colander.Integer())
+
+    def PetSchema(colander.MappingSchema):
+        pet = OneOfSchema(validator=colander.OneOf(['name', 'id']))
 - Take default value from missing attribute (thanks @sp-schoen)
 
 
