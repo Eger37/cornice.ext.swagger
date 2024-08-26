@@ -188,10 +188,10 @@ class DefinitionHandler(object):
         # named 'title' or 'name' within a mapping schema node.
         for key in ['title', 'name']:
             name = getattr(schema, key, None)
-            if isinstance(name, six.string_types) and len(name):
+            if isinstance(name, str) and len(name):
                 return name
             name = schema.get(key)
-            if isinstance(name, six.string_types) and len(name):
+            if isinstance(name, str) and len(name):
                 return name
         return type(schema).__name__
 
@@ -958,14 +958,14 @@ class CorniceSwagger(object):
 
         if not isinstance(deprecated, bool):
             deprecated = False
-        if not deprecated and not isinstance(view, six.string_types):
+        if not deprecated and not isinstance(view, str):
             deprecated = getattr(view, 'deprecated', False)
         if deprecated is True:
             op['deprecated'] = True
 
         if not isinstance(deprecated, bool):
             deprecated = False
-        if not deprecated and not isinstance(view, six.string_types):
+        if not deprecated and not isinstance(view, str):
             deprecated = getattr(view, 'deprecated', False)
         if deprecated is True:
             op['deprecated'] = True
@@ -973,7 +973,7 @@ class CorniceSwagger(object):
         # Get summary from docstring
         if self.summary_docstrings:
             docstring = None
-            if isinstance(view, six.string_types):
+            if isinstance(view, str):
                 if 'klass' in args:
                     ob = args['klass']
                     view_ = getattr(ob, view.lower())
